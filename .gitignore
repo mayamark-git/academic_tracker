@@ -9,6 +9,7 @@ venv/
 # local env
 .env
 .env.*
+!.env.example
 
 # database
 *.db
