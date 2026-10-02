@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.venv/
+venv/
+
+# local env
+.env
+.env.*
+
+# database
+*.db
+*.db-shm
+*.db-wal
+
+# PDF data
+pdf_files/
+
+# editors
+.vscode/
+.DS_Store
