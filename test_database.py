@@ -133,6 +133,16 @@ class DatabaseConnectionTests(unittest.TestCase):
                     "author", "first_author", "doi", "user_memo", "local_pdf_path"
                 } <= paper_columns)
                 self.assertTrue({"memo", "academic_societies"} <= profile_columns)
+                research_watch_tables = {
+                    row["name"] for row in connection.execute(
+                        "SELECT name FROM sqlite_master WHERE type = 'table'"
+                    )
+                }
+                self.assertTrue({
+                    "research_topics",
+                    "research_watch_runs",
+                    "research_watch_digests",
+                } <= research_watch_tables)
                 self.assertEqual(
                     connection.execute("SELECT title FROM papers").fetchone()["title"],
                     "Legacy paper",

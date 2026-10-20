@@ -57,6 +57,15 @@ from researcher_profiles import (
     fetch_researcher_profile_with_ai as fetch_researcher_profile,
     save_fetched_researcher_profile,
 )
+from research_watch import (
+    add_research_topic,
+    build_gemini_research_watch_adapters,
+    collect_research_topic,
+    delete_research_topic,
+    get_due_research_topics,
+    get_research_topics,
+    get_research_watch_history,
+)
 
 import streamlit as st
 
@@ -356,6 +365,15 @@ def call_gemini_with_google_search(prompt: str, preferred_model: str = "gemini-3
         ) from fallback_err
 
 
+def generate_research_watch_content(prompt: str, config=None):
+    client = _gemini_client()
+    return client.models.generate_content(
+        model="gemini-3.6-flash",
+        contents=prompt,
+        config=config,
+    )
+
+
 def summarize_pdf_with_gemini(paper_title, pdf_path):
     """Geminiを使ってPDF論文の内容を精査・要約。論文ドラフト作成に資する洞察を抽出"""
     pdf_text = extract_text_from_pdf(pdf_path, max_pages=2)
@@ -625,6 +643,7 @@ page = st.radio(
     [
         "📄 論文一覧",
         "🧭 自分の論文から探す",
+        "🔭 研究テーマ情報",
         "👤 研究者プロファイル",
         "🏛️ 関連学会アーカイブ",
         "⚙️ 著者・キーワード管理"
@@ -1621,7 +1640,148 @@ elif page == "🧭 自分の論文から探す":
 
 
 # ============================================================
-# 3: 研究者プロファイル
+# 3: 研究テーマ情報の自動収集
+# ============================================================
+
+elif page == "🔭 研究テーマ情報":
+    st.subheader("🔭 研究テーマの情報収集・要約")
+    st.caption(
+        "登録テーマごとに、学術論文と公的機関の報告を週1回収集して要約します。"
+        "自動収集はこの画面を開いた時に期限を確認して実行します。"
+    )
+    st.info(
+        "検索語と論文の書誌・抄録はCiNii/Geminiへ送信されます。"
+        "公的報告の検索にはGoogle検索を使い、確認できた出典URLを保存します。"
+    )
+
+    with st.form("add_research_watch_topic"):
+        topic_name = st.text_input("研究テーマ", placeholder="例: 地域コミュニティとサードプレイス")
+        topic_keywords = st.text_area(
+            "検索キーワード（1行に1件、最大5件）",
+            placeholder="地域コミュニティ\nサードプレイス\n居場所",
+        )
+        add_topic = st.form_submit_button("研究テーマを登録", type="primary")
+
+    if add_topic:
+        try:
+            with get_connection() as conn:
+                add_research_topic(conn, topic_name, topic_keywords)
+            st.success("研究テーマを登録しました。")
+            st.rerun()
+        except Exception as exc:
+            st.error(f"研究テーマを登録できませんでした: {exc}")
+
+    with get_connection() as conn:
+        topics = [dict(topic) for topic in get_research_topics(conn)]
+        due_topics = [dict(topic) for topic in get_due_research_topics(conn)]
+
+    if not topics:
+        st.info("研究テーマを登録すると、関連情報の収集と要約を開始できます。")
+    else:
+        due_topic_ids = {topic["id"] for topic in due_topics}
+        for topic in topics:
+            topic_id = topic["id"]
+            keywords = json.loads(topic["keywords_json"])
+            with st.container(border=True):
+                topic_col, action_col, delete_col = st.columns([5, 2, 1])
+                with topic_col:
+                    st.markdown(f"### {topic['name']}")
+                    st.caption("検索語: " + "、".join(keywords))
+                    st.caption(
+                        "最終実行: "
+                        + (topic["last_attempt_at"] or "未実行")
+                        + (" · 次回表示時に週次収集" if topic_id in due_topic_ids else "")
+                    )
+                with action_col:
+                    run_now = st.button(
+                        "今すぐ収集",
+                        key=f"run_research_watch_{topic_id}",
+                        use_container_width=True,
+                    )
+                with delete_col:
+                    remove_topic = st.button(
+                        "削除",
+                        key=f"delete_research_watch_{topic_id}",
+                        use_container_width=True,
+                    )
+                if remove_topic:
+                    with get_connection() as conn:
+                        delete_research_topic(conn, topic_id)
+                    st.rerun()
+
+                should_run = topic_id in due_topic_ids or run_now
+                if should_run:
+                    try:
+                        with st.spinner(f"「{topic['name']}」の情報を収集・要約中..."):
+                            adapters = build_gemini_research_watch_adapters(
+                                generate_research_watch_content,
+                                types.GenerateContentConfig(
+                                    tools=[types.Tool(google_search=types.GoogleSearch())],
+                                    temperature=0.1,
+                                ),
+                            )
+                            with get_connection() as conn:
+                                outcome = collect_research_topic(
+                                    conn,
+                                    topic_id,
+                                    *adapters,
+                                )
+                        if outcome["errors"]:
+                            st.warning(
+                                f"収集状態: {outcome['status']}。"
+                                + "\n".join(outcome["errors"])
+                            )
+                        else:
+                            st.success(
+                                f"収集完了: 出典 {outcome['item_count']} 件を整理しました。"
+                            )
+                    except Exception as exc:
+                        st.error(f"テーマ情報を収集できませんでした: {exc}")
+
+                with get_connection() as conn:
+                    history = get_research_watch_history(conn, topic_id, limit=5)
+                if not history:
+                    st.caption("まだ収集履歴がありません。")
+                for row in history:
+                    if not row["source_type"]:
+                        st.warning(
+                            f"{row['started_at']} · {row['status']}"
+                            + (f" · {row['error_message']}" if row["error_message"] else "")
+                        )
+                        continue
+                    source_label = (
+                        "学術論文" if row["source_type"] == "academic_papers"
+                        else "公的機関の報告"
+                    )
+                    with st.expander(
+                        f"{source_label} · {row['digest_created_at']}",
+                        expanded=False,
+                    ):
+                        st.write(row["summary"])
+                        for source in json.loads(row["sources_json"] or "[]"):
+                            title = source.get("title") or "出典を開く"
+                            url = source.get("url")
+                            if url:
+                                st.markdown(f"- [{title}]({url})")
+                            else:
+                                author_year = " · ".join(
+                                    item for item in (
+                                        source.get("author", ""),
+                                        source.get("published", ""),
+                                        source.get("doi", ""),
+                                    )
+                                    if item
+                                )
+                                st.markdown(
+                                    f"- **{title}**"
+                                    + (f" — {author_year}" if author_year else "")
+                                )
+                    if row["error_message"]:
+                        st.warning(row["error_message"])
+
+
+# ============================================================
+# 4: 研究者プロファイル
 # ============================================================
 
 elif page == "👤 研究者プロファイル":

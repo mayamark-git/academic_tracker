@@ -7,6 +7,7 @@ from contextlib import closing
 from os import PathLike
 
 from research_discovery import initialize_discovery_schema
+from research_watch import initialize_research_watch_schema
 
 
 def initialize_database(
@@ -122,6 +123,7 @@ def initialize_database(
         )
     """)
     initialize_discovery_schema(conn)
+    initialize_research_watch_schema(conn)
     conn.executemany(
         "INSERT OR IGNORE INTO system_settings (key, val) VALUES (?, ?)",
         [
