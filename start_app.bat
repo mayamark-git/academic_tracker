@@ -1,4 +1,4 @@
 @echo off
-cd /d "D:\Dドライブ\academic_tracker"
-python -m streamlit run app.py
+cd /d "%~dp0"
+python -m streamlit run app.py --server.address 127.0.0.1 --server.port 8501
 pause
