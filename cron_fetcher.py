@@ -1,19 +1,18 @@
 import os
-import sqlite3
 import re
 import urllib.parse
+from email.utils import parseaddr
+
 import requests
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
+from database import get_connection as connect_database
 
 load_dotenv()
-DB_PATH = "papers.db"
+DB_PATH = os.environ.get("ACADEMIC_TRACKER_DB_PATH", "papers.db")
 
 def get_connection():
-    conn = sqlite3.connect(DB_PATH, timeout=30.0, isolation_level=None)
-    conn.execute("PRAGMA journal_mode=WAL;")
-    conn.row_factory = sqlite3.Row
-    return conn
+    return connect_database(DB_PATH, isolation_level=None)
 
 def clean_url(raw_url: str) -> str:
     if not raw_url:
@@ -24,7 +23,7 @@ def clean_url(raw_url: str) -> str:
         return m.group(0).rstrip('.,;)]')
     return ""
 
-def extract_doi_from_cinii_url(cinii_url: str) -> str:
+def extract_doi_from_cinii_url(cinii_url: str, raise_on_error: bool = False) -> str:
     target_url = clean_url(cinii_url)
     if not target_url or not target_url.startswith("http"):
         return ""
@@ -60,10 +59,12 @@ def extract_doi_from_cinii_url(cinii_url: str) -> str:
         if m:
             return "https://doi.org/" + m.group(1).rstrip('.,;)]')
     except Exception as e:
+        if raise_on_error:
+            raise RuntimeError(f"CiNiiからDOIを取得できませんでした: {e}") from e
         print(f"DOI fetch error: {e}")
     return ""
 
-def fetch_single_detailed_abstract(cinii_url: str) -> str:
+def fetch_single_detailed_abstract(cinii_url: str, raise_on_error: bool = False) -> str:
     target_url = clean_url(cinii_url)
     if not target_url or not target_url.startswith("http"):
         return ""
@@ -91,10 +92,12 @@ def fetch_single_detailed_abstract(cinii_url: str) -> str:
         if abs_tag and abs_tag.get_text(strip=True):
             return abs_tag.get_text(strip=True)
     except Exception as e:
+        if raise_on_error:
+            raise RuntimeError(f"CiNiiから抄録を取得できませんでした: {e}") from e
         print(f"Abstract fetch error: {e}")
     return ""
 
-def fetch_papers_from_cinii_api(query_str: str, is_author: bool = False, year_from: int = None, year_to: int = None, sort_order: str = "0", max_results: int = 30) -> list:
+def fetch_papers_from_cinii_api(query_str: str, is_author: bool = False, year_from: int = None, year_to: int = None, sort_order: str = "0", max_results: int = 30, raise_on_error: bool = False) -> list:
     """CiNii Research OpenSearch API経由で論文メタデータを安全に取得"""
     cinii_appid = os.getenv("CINII_APPID", "")
     base_api = "https://cir.nii.ac.jp/opensearch/articles"
@@ -126,16 +129,23 @@ def fetch_papers_from_cinii_api(query_str: str, is_author: bool = False, year_fr
     try:
         # 短めのタイムアウト（7秒）でハングアップを確実に防ぐ
         res = requests.get(base_api, params=params, timeout=7)
-        if res.status_code == 200:
-            data = res.json()
+        if res.status_code != 200:
+            raise requests.exceptions.HTTPError(
+                f"HTTP {res.status_code}", response=res
+            )
+        data = res.json()
+        if isinstance(data, dict):
             items = []
             if "@graph" in data and isinstance(data["@graph"], list) and len(data["@graph"]) > 0:
                 items = data["@graph"][0].get("items", [])
             elif "items" in data:
                 items = data.get("items", [])
-                
+
             for it in items:
-                title = it.get("title", "").strip()
+                title_value = it.get("title", "")
+                if isinstance(title_value, dict):
+                    title_value = title_value.get("@value", title_value.get("value", ""))
+                title = str(title_value or "").strip()
                 if not title:
                     continue
                     
@@ -149,14 +159,28 @@ def fetch_papers_from_cinii_api(query_str: str, is_author: bool = False, year_fr
                     author_val = creators.get("@value", "")
 
                 first_author = author_val.split("・")[0].split(",")[0].strip() if author_val else ""
-                journal = it.get("prism:publicationName", "") or it.get("publicationName", "不明")
+                journal_value = it.get("prism:publicationName", "") or it.get("publicationName", "不明")
+                if isinstance(journal_value, dict):
+                    journal_value = journal_value.get("@value", journal_value.get("value", "不明"))
+                journal = str(journal_value or "不明")
                 pub_date = str(it.get("prism:publicationDate", "") or it.get("publicationDate", ""))[:4]
                 if not pub_date or not pub_date.isdigit():
                     pub_date = "年不明"
                     
-                url = clean_url(it.get("@id", "") or it.get("link", {}).get("@id", ""))
-                doi = clean_url(it.get("prism:doi", "") or it.get("doi", ""))
+                link_value = it.get("link", {})
+                if isinstance(link_value, dict):
+                    link_value = link_value.get("@id", "")
+                url = clean_url(it.get("@id", "") or link_value)
+                doi_value = it.get("prism:doi", "") or it.get("doi", "")
+                if isinstance(doi_value, dict):
+                    doi_value = doi_value.get("@value", doi_value.get("value", ""))
+                doi = clean_url(str(doi_value)) or str(doi_value or "").strip()
                 description = it.get("description", "") or it.get("dc:description", "") or ""
+                if isinstance(description, dict):
+                    description = description.get("@value", description.get("value", ""))
+                elif isinstance(description, list):
+                    description = " ".join(str(item) for item in description if item)
+                description = str(description or "")
 
                 results.append({
                     "title": title,
@@ -170,15 +194,20 @@ def fetch_papers_from_cinii_api(query_str: str, is_author: bool = False, year_fr
                     "matched_keyword": query_str
                 })
     except (requests.exceptions.Timeout, requests.exceptions.RequestException) as e:
+        if raise_on_error:
+            raise RuntimeError(f"CiNii APIから「{clean_query}」を取得できませんでした: {e}") from e
         print(f"CiNii API timeout or error for [{clean_query}]: {e}")
     except Exception as e:
+        if raise_on_error:
+            raise RuntimeError(f"CiNiiの応答を「{clean_query}」について解析できませんでした: {e}") from e
         print(f"CiNii parsing error for [{clean_query}]: {e}")
         
     return results
 
-def fetch_new_papers_from_cinii() -> int:
+def fetch_new_papers_from_cinii(raise_on_error: bool = False) -> int:
     """研究者・キーワードから論文を取得。ハングアップせず確実に処理を完了する"""
     added_count = 0
+    failures = []
     with get_connection() as conn:
         c = conn.cursor()
         
@@ -190,10 +219,17 @@ def fetch_new_papers_from_cinii() -> int:
 
         # 1. 研究者ごとの取得（関連度順 ＋ 古い順）
         for author in target_authors:
-            papers_rel = fetch_papers_from_cinii_api(author, is_author=True, sort_order="0", max_results=30)
-            papers_old = fetch_papers_from_cinii_api(author, is_author=True, sort_order="2", max_results=20)
-            
-            for p in papers_rel + papers_old:
+            author_papers = []
+            for sort_order, limit in (("0", 30), ("2", 20)):
+                try:
+                    author_papers.extend(fetch_papers_from_cinii_api(
+                        author, is_author=True, sort_order=sort_order,
+                        max_results=limit, raise_on_error=raise_on_error,
+                    ))
+                except Exception as exc:
+                    failures.append(f"著者「{author}」: {exc}")
+
+            for p in author_papers:
                 t = p['title']
                 if t in existing_titles or t in ignored_titles:
                     continue
@@ -207,7 +243,14 @@ def fetch_new_papers_from_cinii() -> int:
         # 2. キーワードごとの取得
         for kw in target_keywords:
             # 複数ワードにも対応できるよう、全年代・関連度順で安全に取得
-            papers = fetch_papers_from_cinii_api(kw, is_author=False, sort_order="0", max_results=30)
+            try:
+                papers = fetch_papers_from_cinii_api(
+                    kw, is_author=False, sort_order="0", max_results=30,
+                    raise_on_error=raise_on_error,
+                )
+            except Exception as exc:
+                failures.append(f"キーワード「{kw}」: {exc}")
+                continue
             
             for p in papers:
                 t = p['title']
@@ -220,10 +263,18 @@ def fetch_new_papers_from_cinii() -> int:
                 existing_titles.add(t)
                 added_count += 1
 
+    if failures:
+        message = (
+            f"CiNii検索で{len(failures)}件の条件に失敗しました。"
+            f"新規追加: {added_count}件。\n" + "\n".join(failures)
+        )
+        if raise_on_error:
+            raise RuntimeError(message)
+        print(message)
     return added_count
 
 
-def fetch_pdf_url_from_unpaywall(doi: str) -> str:
+def fetch_pdf_url_from_unpaywall(doi: str, raise_on_error: bool = False) -> str:
     """Unpaywall APIを使用してオープンアクセスPDFの直リンクURLを取得"""
     clean_doi_str = doi.strip()
     if not clean_doi_str:
@@ -233,9 +284,23 @@ def fetch_pdf_url_from_unpaywall(doi: str) -> str:
     clean_doi_str = re.sub(r'^doi:\s*', '', clean_doi_str, flags=re.IGNORECASE)
     clean_doi_str = clean_doi_str.strip().rstrip('.,;)]}')
 
-    url = f"https://api.unpaywall.org/v2/{clean_doi_str}?email=unpaywall_academic@example.com"
+    email = os.getenv("UNPAYWALL_EMAIL", "").strip()
+    parsed_email = parseaddr(email)[1]
+    if (
+        not parsed_email
+        or parsed_email != email
+        or "@" not in parsed_email
+        or "." not in parsed_email.rsplit("@", 1)[-1]
+    ):
+        message = "Unpaywall APIには有効な連絡先メールが必要です。.env に UNPAYWALL_EMAIL を設定してください。"
+        if raise_on_error:
+            raise RuntimeError(message)
+        print(message)
+        return ""
+
+    url = "https://api.unpaywall.org/v2/" + urllib.parse.quote(clean_doi_str, safe="/")
     try:
-        res = requests.get(url, timeout=5)
+        res = requests.get(url, params={"email": email}, timeout=5)
         if res.status_code == 200:
             data = res.json()
             if data.get("is_oa"):
@@ -243,7 +308,13 @@ def fetch_pdf_url_from_unpaywall(doi: str) -> str:
                 pdf_url = best_location.get("url_for_pdf")
                 if pdf_url:
                     return pdf_url
+        else:
+            raise requests.exceptions.HTTPError(
+                f"HTTP {res.status_code}", response=res
+            )
     except Exception as e:
+        if raise_on_error:
+            raise RuntimeError(f"UnpaywallからPDF情報を取得できませんでした: {e}") from e
         print(f"Unpaywall API error for DOI [{clean_doi_str}]: {e}")
     return ""
 
@@ -258,25 +329,39 @@ def get_jstage_pdf_url(url: str) -> str:
     return ""
 
 
-def download_pdf_file(url: str, save_path: str) -> bool:
+def download_pdf_file(url: str, save_path: str, raise_on_error: bool = False) -> bool:
     """指定されたURLからPDFファイルをダウンロードして保存"""
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
     }
+    temporary_path = f"{save_path}.part"
     try:
         res = requests.get(url, headers=headers, stream=True, timeout=15)
-        if res.status_code == 200:
-            # コンテンツタイプがPDFであることを緩やかに確認
-            content_type = res.headers.get('Content-Type', '').lower()
-            if 'html' in content_type:
-                return False
-                
-            os.makedirs(os.path.dirname(save_path), exist_ok=True)
-            with open(save_path, "wb") as f:
-                for chunk in res.iter_content(chunk_size=8192):
-                    if chunk:
-                        f.write(chunk)
-            return True
+        if res.status_code != 200:
+            raise requests.exceptions.HTTPError(
+                f"HTTP {res.status_code}", response=res
+            )
+
+        content_type = res.headers.get('Content-Type', '').lower()
+        if 'html' in content_type:
+            raise ValueError("PDFではなくHTMLが返されました。")
+
+        parent_dir = os.path.dirname(save_path)
+        if parent_dir:
+            os.makedirs(parent_dir, exist_ok=True)
+        with open(temporary_path, "wb") as output_file:
+            for chunk in res.iter_content(chunk_size=8192):
+                if chunk:
+                    output_file.write(chunk)
+        with open(temporary_path, "rb") as downloaded_file:
+            if downloaded_file.read(5) != b"%PDF-":
+                raise ValueError("取得したファイルが有効なPDFではありません。")
+        os.replace(temporary_path, save_path)
+        return True
     except Exception as e:
+        if os.path.exists(temporary_path):
+            os.remove(temporary_path)
+        if raise_on_error:
+            raise RuntimeError(f"PDFのダウンロードに失敗しました: {e}") from e
         print(f"Failed to download PDF from {url}: {e}")
-    return False
+        return False

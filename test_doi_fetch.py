@@ -55,25 +55,33 @@ def extract_doi_via_cinii_api(url):
     except Exception as e:
         return None, f"API通信エラー: {e}"
 
-print("=== 🔬 CiNii 公式JSON-LD APIによるDOI抽出テスト ===")
-conn = sqlite3.connect(DB_PATH)
-conn.row_factory = sqlite3.Row
+def run_doi_fetch_smoke_test():
+    print("=== 🔬 CiNii 公式JSON-LD APIによるDOI抽出テスト ===")
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    try:
+        rows = conn.execute(
+            "SELECT id, title, url FROM papers WHERE url LIKE '%crid%' LIMIT 20"
+        ).fetchall()
 
-# DOIが見つかるか確認するため上位20件をテストスキャン
-rows = conn.execute("SELECT id, title, url FROM papers WHERE url LIKE '%crid%' LIMIT 20").fetchall()
+        found_count = 0
+        for row in rows:
+            paper_id, title, url = row["id"], row["title"], row["url"]
+            doi, method = extract_doi_via_cinii_api(url)
+            print("\n" + "-" * 50)
+            print(f"【ID {paper_id}】: {title[:35]}...")
+            if doi:
+                print(f"🎉 取得成功: {doi}")
+                print(f"   (取得元: {method})")
+                found_count += 1
+            else:
+                print(f"ℹ️ {method}")
 
-found_count = 0
-for r in rows:
-    p_id, title, url = r['id'], r['title'], r['url']
-    doi, method = extract_doi_via_cinii_api(url)
-    print("\n" + "-"*50)
-    print(f"【ID {p_id}】: {title[:35]}...")
-    if doi:
-        print(f"🎉 取得成功: {doi}")
-        print(f"   (取得元: {method})")
-        found_count += 1
-    else:
-        print(f"ℹ️ {method}")
+        print("\n" + "=" * 60)
+        print(f"テスト完了: {len(rows)}件中 {found_count} 件でDOIを検出しました。")
+    finally:
+        conn.close()
 
-print("\n" + "="*60)
-print(f"テスト完了: 20件中 {found_count} 件でDOIを検出しました。")
+
+if __name__ == "__main__":
+    run_doi_fetch_smoke_test()

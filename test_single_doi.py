@@ -36,8 +36,13 @@ def fetch_doi_via_cinii_json(crid_url):
         
     return None
 
-doi = fetch_doi_via_cinii_json(TARGET_URL)
-if doi:
-    print(f"🎉 取得大成功: {doi}")
-else:
-    print("⚠️ DOIは見つかりませんでした。")
+def run_single_doi_smoke_test():
+    doi = fetch_doi_via_cinii_json(TARGET_URL)
+    if doi:
+        print(f"🎉 取得大成功: {doi}")
+    else:
+        print("⚠️ DOIは見つかりませんでした。")
+
+
+if __name__ == "__main__":
+    run_single_doi_smoke_test()

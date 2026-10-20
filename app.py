@@ -6,19 +6,52 @@ import warnings
 import urllib.parse
 import re
 import json
+import hashlib
 import requests
 
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
+from database import (
+    create_database_backup,
+    export_papers_csv,
+    get_connection as connect_database,
+    initialize_database,
+)
 
 from cron_fetcher import (
     fetch_new_papers_from_cinii,
     fetch_single_detailed_abstract,
     clean_url,
     extract_doi_from_cinii_url,
+    fetch_papers_from_cinii_api,
     fetch_pdf_url_from_unpaywall,
     get_jstage_pdf_url,
     download_pdf_file
+)
+from research_discovery import (
+    MAX_PDF_BATCH_SIZE,
+    analyze_research_baseline,
+    build_baseline_context,
+    create_discovery_run,
+    evaluate_candidate_batches,
+    filter_discovery_candidates,
+    get_discovery_candidates,
+    get_candidates_ready_for_evaluation_retry,
+    get_discovery_runs,
+    get_discovery_processing_status,
+    is_pdf_candidate_eligible,
+    merge_candidate_into_papers,
+    normalize_extraction,
+    normalize_title,
+    process_discovery_candidate,
+    save_candidate_evaluations,
+    save_research_baseline,
+    safe_paper_pdf_path,
+    search_discovery_candidates,
+    set_discovery_candidate_selected,
+    split_text,
+    update_research_baseline_analysis,
+    validate_pdf_batch_size,
 )
 
 import streamlit as st
@@ -41,7 +74,7 @@ warnings.filterwarnings("ignore", category=DeprecationWarning)
 
 load_dotenv()
 
-DB_PATH = "papers.db"
+DB_PATH = os.environ.get("ACADEMIC_TRACKER_DB_PATH", "papers.db")
 PDF_DIR = "pdf_files"
 
 
@@ -50,14 +83,7 @@ PDF_DIR = "pdf_files"
 # ============================================================
 
 def get_connection():
-    conn = sqlite3.connect(
-        DB_PATH,
-        timeout=30.0,
-        isolation_level=None
-    )
-    conn.execute("PRAGMA journal_mode=WAL;")
-    conn.row_factory = sqlite3.Row
-    return conn
+    return connect_database(DB_PATH, isolation_level=None)
 
 
 # ============================================================
@@ -266,8 +292,7 @@ def call_gemini_with_retry(prompt: str, preferred_model: str = "gemini-3.6-flash
     client = _gemini_client()
     last_err = None
 
-    # 429制限時に長時間フリーズしないよう、リトライ待機を短縮
-    for attempt in range(2):
+    for attempt in range(4):
         try:
             response = client.models.generate_content(
                 model=preferred_model,
@@ -281,8 +306,8 @@ def call_gemini_with_retry(prompt: str, preferred_model: str = "gemini-3.6-flash
             last_err = e
             if _is_quota_error(e):
                 break
-            if _is_transient_error(e) and attempt == 0:
-                time.sleep(2)
+            if _is_transient_error(e) and attempt < 3:
+                time.sleep(2 ** (attempt + 1))
                 continue
             break
 
@@ -354,6 +379,72 @@ def summarize_pdf_with_gemini(paper_title, pdf_path):
     if "---" in res_text:
         res_text = res_text.split("---")[-1].strip()
     return res_text
+
+
+def extract_full_pdf_text(pdf_path):
+    if not PdfReader:
+        raise RuntimeError("PDF解析ライブラリ pypdf がインストールされていません。")
+    if not pdf_path or not os.path.isfile(pdf_path):
+        raise FileNotFoundError(f"PDFファイルが見つかりません: {pdf_path}")
+
+    try:
+        reader = PdfReader(str(pdf_path), strict=False)
+        extracted = []
+        for page_number, page in enumerate(reader.pages, start=1):
+            page_text = (page.extract_text() or "").strip()
+            if page_text:
+                extracted.append(f"[p.{page_number}]\n{page_text}")
+    except Exception as exc:
+        raise RuntimeError(f"PDFを読み取れませんでした: {exc}") from exc
+
+    full_text = "\n\n".join(extracted).strip()
+    if len(full_text) < 100:
+        raise ValueError("PDFから十分なテキストを抽出できません。スキャン画像PDFの場合はOCR済みPDFを使用してください。")
+    return full_text
+
+
+def summarize_full_pdf_with_gemini(paper_title, pdf_path):
+    chunks = split_text(extract_full_pdf_text(pdf_path))
+    partial_summaries = []
+    for index, chunk in enumerate(chunks, start=1):
+        prompt = f"""学術論文の本文抜粋を、後で論文全体を統合要約するために整理してください。
+入力にない情報は補わず、重要な主張と根拠をページ番号とともに残してください。
+論文タイトル: {paper_title}
+本文抜粋 {index}/{len(chunks)}:
+{chunk}
+"""
+        partial_summaries.append(call_gemini_with_retry(prompt))
+
+    while len(partial_summaries) > 8:
+        condensed = []
+        for offset in range(0, len(partial_summaries), 8):
+            summary_batch = partial_summaries[offset:offset + 8]
+            condense_prompt = f"""以下は同一論文の本文チャンク要約です。重複を整理し、重要な主張・方法・根拠ページを保持して簡潔に統合してください。
+入力にない情報は追加しないでください。
+
+{chr(10).join(summary_batch)}
+"""
+            condensed.append(call_gemini_with_retry(condense_prompt))
+        partial_summaries = condensed
+
+    final_prompt = f"""あなたは学術論文を精読するリサーチアシスタントです。
+以下の本文全体から作成した分割要約を統合し、記載された根拠だけで回答してください。
+全体を通じた知見を統合し、相反や情報不足があれば明記してください。
+ページ番号が示されている場合は根拠とともに保持してください。
+
+論文タイトル: {paper_title}
+分割要約:
+{chr(10).join(partial_summaries)}
+
+以下の見出しで、各項目を数行程度にまとめてください。
+- 研究目的・研究課題
+- 理論・概念
+- 研究方法・対象
+- 主な知見
+- 限界・今後の課題
+- 自分の研究との接点
+"""
+    return call_gemini_with_retry(final_prompt)
 
 
 def parse_robust_json_profile(raw_text: str) -> dict:
@@ -573,121 +664,21 @@ def update_researcher_profiles_from_single_society(soc_name: str, related_author
 
 def init_db(clear_papers_only=False):
     with get_connection() as conn:
-        c = conn.cursor()
+        initialize_database(conn, clear_papers_only=clear_papers_only)
 
-        if clear_papers_only:
-            c.execute("DROP TABLE IF EXISTS papers")
-            c.execute("DROP TABLE IF EXISTS ignored_papers")
 
-        c.execute("""
-            CREATE TABLE IF NOT EXISTS papers (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                title TEXT UNIQUE,
-                author TEXT,
-                first_author TEXT DEFAULT '',
-                journal TEXT,
-                pub_date TEXT,
-                url TEXT,
-                doi TEXT DEFAULT '',
-                abstract TEXT DEFAULT '',
-                ai_insight TEXT DEFAULT '',
-                priority TEXT DEFAULT '中',
-                suggested_section TEXT DEFAULT '',
-                draft_text TEXT DEFAULT '',
-                local_pdf_path TEXT DEFAULT '',
-                matched_keyword TEXT DEFAULT '',
-                user_memo TEXT DEFAULT '',
-                is_read INTEGER DEFAULT 0,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
+@st.cache_resource
+def initialize_app_database():
+    init_db(clear_papers_only=False)
 
-        try:
-            c.execute("ALTER TABLE papers ADD COLUMN first_author TEXT DEFAULT ''")
-        except sqlite3.OperationalError:
-            pass
 
-        try:
-            c.execute("ALTER TABLE papers ADD COLUMN doi TEXT DEFAULT ''")
-        except sqlite3.OperationalError:
-            pass
-
-        c.execute("""
-            CREATE TABLE IF NOT EXISTS ignored_papers (
-                title TEXT PRIMARY KEY,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-
-        c.execute("""
-            CREATE TABLE IF NOT EXISTS target_authors (
-                name TEXT PRIMARY KEY,
-                affiliation TEXT,
-                memo TEXT,
-                sort_order INTEGER DEFAULT 0,
-                column_idx INTEGER DEFAULT 0
-            )
-        """)
-
-        try:
-            c.execute("ALTER TABLE target_authors ADD COLUMN sort_order INTEGER DEFAULT 0")
-        except sqlite3.OperationalError:
-            pass
-
-        try:
-            c.execute("ALTER TABLE target_authors ADD COLUMN column_idx INTEGER DEFAULT 0")
-        except sqlite3.OperationalError:
-            pass
-
-        c.execute("""
-            CREATE TABLE IF NOT EXISTS target_keywords (
-                keyword TEXT PRIMARY KEY,
-                category TEXT
-            )
-        """)
-
-        c.execute("""
-            CREATE TABLE IF NOT EXISTS researcher_profiles (
-                name TEXT PRIMARY KEY,
-                field TEXT,
-                school_of_thought TEXT,
-                key_concepts TEXT,
-                memo TEXT,
-                academic_societies TEXT DEFAULT ''
-            )
-        """)
-
-        c.execute("""
-            CREATE TABLE IF NOT EXISTS academic_societies (
-                name TEXT PRIMARY KEY,
-                related_authors TEXT DEFAULT '',
-                category TEXT DEFAULT '未分類',
-                official_url TEXT DEFAULT '',
-                user_memo TEXT DEFAULT '',
-                is_target INTEGER DEFAULT 0
-            )
-        """)
-
-        c.execute("""
-            CREATE TABLE IF NOT EXISTS system_settings (
-                key TEXT PRIMARY KEY,
-                val TEXT
-            )
-        """)
-
-        try:
-            c.execute("ALTER TABLE researcher_profiles ADD COLUMN memo TEXT DEFAULT ''")
-        except sqlite3.OperationalError:
-            pass
-
-        try:
-            c.execute("ALTER TABLE researcher_profiles ADD COLUMN academic_societies TEXT DEFAULT ''")
-        except sqlite3.OperationalError:
-            pass
-
-        c.execute("INSERT OR IGNORE INTO system_settings (key, val) VALUES ('col_label_0', '第1列（メイン）')")
-        c.execute("INSERT OR IGNORE INTO system_settings (key, val) VALUES ('col_label_1', '第2列（重要著者）')")
-        c.execute("INSERT OR IGNORE INTO system_settings (key, val) VALUES ('col_label_2', '第3列（参考）')")
+def evaluate_discovery_candidates(baseline, candidates):
+    return evaluate_candidate_batches(
+        baseline,
+        candidates,
+        call_gemini_with_retry,
+        batch_size=10,
+    )
 
 
 # ============================================================
@@ -701,6 +692,8 @@ st.set_page_config(
     initial_sidebar_state="collapsed"
 )
 
+initialize_app_database()
+
 st.title("📚 論文アーカイブ & リサーチトラッカー")
 
 if "nav_page" not in st.session_state:
@@ -710,6 +703,7 @@ page = st.radio(
     "ナビゲーション",
     [
         "📄 論文一覧",
+        "🧭 自分の論文から探す",
         "👤 研究者プロファイル",
         "🏛️ 関連学会アーカイブ",
         "⚙️ 著者・キーワード管理"
@@ -736,9 +730,13 @@ if page == "📄 論文一覧":
     with col_t2:
         if st.button("🔄 CiNiiから新着を取得", type="primary", use_container_width=True):
             with st.spinner("CiNiiからターゲット著者・キーワードの新着論文を取得中..."):
-                added = fetch_new_papers_from_cinii()
-                st.success(f"取得完了: 新規 {added} 件追加")
-                st.rerun()
+                try:
+                    added = fetch_new_papers_from_cinii(raise_on_error=True)
+                except Exception as exc:
+                    st.error(f"CiNii検索が一部または全部失敗しました: {exc}")
+                else:
+                    st.success(f"取得完了: 新規 {added} 件追加")
+                    st.rerun()
 
     with col_t3:
         if st.button("📂 ローカルPDFスキャン", type="secondary", use_container_width=True, help="pdf_filesフォルダ内のPDFをタイトル照合してDBに紐付け"):
@@ -811,6 +809,47 @@ if page == "📄 論文一覧":
                 time.sleep(2)
                 st.rerun()
 
+    with st.expander("データのバックアップとエクスポート", expanded=False):
+        st.caption(
+            "SQLiteバックアップには論文・研究者・学会・設定などのDB情報が含まれます。"
+            "PDFファイル自体は含まれないため、必要な場合は pdf_files フォルダも別途保管してください。"
+        )
+        backup_col, export_col = st.columns(2)
+        with backup_col:
+            if st.button("最新のDBバックアップを作成", key="create_db_backup"):
+                try:
+                    st.session_state["db_backup_data"] = create_database_backup(DB_PATH)
+                    st.session_state["db_backup_name"] = (
+                        f"academic_tracker_backup_{time.strftime('%Y%m%d_%H%M%S')}.db"
+                    )
+                except Exception as exc:
+                    st.error(f"DBバックアップを作成できませんでした: {exc}")
+            if st.session_state.get("db_backup_data"):
+                st.download_button(
+                    "SQLiteバックアップをダウンロード",
+                    data=st.session_state["db_backup_data"],
+                    file_name=st.session_state["db_backup_name"],
+                    mime="application/vnd.sqlite3",
+                    key="download_db_backup",
+                )
+        with export_col:
+            if st.button("論文一覧CSVを作成", key="create_papers_csv"):
+                try:
+                    st.session_state["papers_csv_data"] = export_papers_csv(DB_PATH)
+                    st.session_state["papers_csv_name"] = (
+                        f"academic_tracker_papers_{time.strftime('%Y%m%d_%H%M%S')}.csv"
+                    )
+                except Exception as exc:
+                    st.error(f"論文CSVを作成できませんでした: {exc}")
+            if st.session_state.get("papers_csv_data"):
+                st.download_button(
+                    "論文CSVをダウンロード",
+                    data=st.session_state["papers_csv_data"],
+                    file_name=st.session_state["papers_csv_name"],
+                    mime="text/csv",
+                    key="download_papers_csv",
+                )
+
     with get_connection() as conn:
         total_count = conn.execute("SELECT count(*) FROM papers").fetchone()[0]
         db_keywords = [
@@ -832,7 +871,7 @@ if page == "📄 論文一覧":
     if "filter_sort" not in st.session_state:
         st.session_state.filter_sort = "出版年 (新しい順)"
     if "filter_per_page" not in st.session_state:
-        st.session_state.filter_per_page = 50
+        st.session_state.filter_per_page = 10
     if "filter_page" not in st.session_state:
         st.session_state.filter_page = 1
 
@@ -907,6 +946,8 @@ if page == "📄 論文一覧":
     elif selected_read == "既読":
         query += " AND is_read = 1"
 
+    count_query = query.replace("SELECT *", "SELECT COUNT(*)", 1)
+
     if sort_order == "出版年 (新しい順)":
         query += " ORDER BY pub_date DESC, id DESC"
     elif sort_order == "出版年 (古い順)":
@@ -924,15 +965,13 @@ if page == "📄 論文一覧":
         query += " ORDER BY id ASC"
 
     with get_connection() as conn:
-        all_matched_papers = [dict(row) for row in conn.execute(query, params).fetchall()]
-
-    total_matched = len(all_matched_papers)
+        total_matched = conn.execute(count_query, params).fetchone()[0]
 
     p_col1, p_col2, p_col3 = st.columns([2.6, 1.0, 1.2])
 
     with p_col2:
-        per_page_opts = [20, 50, 100]
-        per_page_idx = per_page_opts.index(st.session_state.filter_per_page) if st.session_state.filter_per_page in per_page_opts else 1
+        per_page_opts = [10, 20, 50]
+        per_page_idx = per_page_opts.index(st.session_state.filter_per_page) if st.session_state.filter_per_page in per_page_opts else 0
         per_page = st.selectbox("1ページの表示件数", per_page_opts, index=per_page_idx)
         st.session_state.filter_per_page = per_page
 
@@ -945,7 +984,14 @@ if page == "📄 論文一覧":
 
     start_idx = (current_page - 1) * per_page
     end_idx = start_idx + per_page
-    display_papers = all_matched_papers[start_idx:end_idx]
+    with get_connection() as conn:
+        display_papers = [
+            dict(row)
+            for row in conn.execute(
+                query + " LIMIT ? OFFSET ?",
+                params + [per_page, start_idx],
+            ).fetchall()
+        ]
 
     with p_col1:
         display_range = f"{start_idx + 1}〜{min(end_idx, total_matched)}" if total_matched > 0 else "0"
@@ -1059,17 +1105,23 @@ if page == "📄 論文一覧":
                     else:
                         if st.button("🔄 DOI再取得", key=f"fetch_doi_{p_id}_{idx}", use_container_width=True):
                             with st.spinner("DOI検索中..."):
-                                found_doi = extract_doi_from_cinii_url(cinii_open_url)
-                                if found_doi:
-                                    clean_found_doi = sanitize_doi(found_doi)
-                                    with get_connection() as conn:
-                                        conn.execute("UPDATE papers SET doi = ? WHERE id = ?", (clean_found_doi, p_id))
+                                try:
+                                    found_doi = extract_doi_from_cinii_url(
+                                        cinii_open_url, raise_on_error=True
+                                    )
+                                    if found_doi:
+                                        clean_found_doi = sanitize_doi(found_doi)
+                                        with get_connection() as conn:
+                                            conn.execute("UPDATE papers SET doi = ? WHERE id = ?", (clean_found_doi, p_id))
+                                        st.session_state[exp_key] = True
+                                        st.success("DOIを取得しました")
+                                        st.rerun()
+                                    else:
+                                        st.session_state[exp_key] = True
+                                        st.info("CiNiiにDOIが登録されていません。再試行する場合はボタンをもう一度押してください。")
+                                except Exception as exc:
                                     st.session_state[exp_key] = True
-                                    st.success("DOIを取得しました")
-                                    st.rerun()
-                                else:
-                                    st.session_state[exp_key] = True
-                                    st.warning("CiNiiからDOIを取得できませんでした。")
+                                    st.error(f"DOI取得に失敗しました。しばらく待って再試行してください: {exc}")
 
                 st.markdown("**📑 論文抄録・要約**")
                 if abstract_val:
@@ -1081,19 +1133,30 @@ if page == "📄 論文一覧":
                     with c_abs2:
                         if st.button("🔄 CiNiiから抄録取得", key=f"fetch_abs_{p_id}_{idx}", use_container_width=True):
                             with st.spinner("抄録検索中..."):
-                                detailed_text = fetch_single_detailed_abstract(cinii_open_url)
-                                found_doi = extract_doi_from_cinii_url(cinii_open_url)
-                                clean_found_doi = sanitize_doi(found_doi) if found_doi else ""
+                                try:
+                                    detailed_text = fetch_single_detailed_abstract(
+                                        cinii_open_url, raise_on_error=True
+                                    )
+                                    found_doi = extract_doi_from_cinii_url(
+                                        cinii_open_url, raise_on_error=True
+                                    )
+                                    clean_found_doi = sanitize_doi(found_doi) if found_doi else ""
 
-                                with get_connection() as conn:
+                                    with get_connection() as conn:
+                                        if detailed_text:
+                                            conn.execute("UPDATE papers SET abstract = ? WHERE id = ?", (detailed_text, p_id))
+                                        if clean_found_doi:
+                                            conn.execute("UPDATE papers SET doi = ? WHERE id = ?", (clean_found_doi, p_id))
+
+                                    st.session_state[exp_key] = True
                                     if detailed_text:
-                                        conn.execute("UPDATE papers SET abstract = ? WHERE id = ?", (detailed_text, p_id))
-                                    if clean_found_doi:
-                                        conn.execute("UPDATE papers SET doi = ? WHERE id = ?", (clean_found_doi, p_id))
-
-                                st.session_state[exp_key] = True
-                                st.success("抄録を取得しました")
-                                st.rerun()
+                                        st.success("抄録を取得しました")
+                                    else:
+                                        st.info("CiNiiに抄録が登録されていません。")
+                                    st.rerun()
+                                except Exception as exc:
+                                    st.session_state[exp_key] = True
+                                    st.error(f"CiNiiからの抄録取得に失敗しました。しばらく待って再試行してください: {exc}")
 
                 st.markdown("---")
                 if has_pdf:
@@ -1131,7 +1194,14 @@ if page == "📄 論文一覧":
                             with st.spinner("PDFの直リンクを探索中..."):
                                 pdf_url = ""
                                 if doi_val:
-                                    pdf_url = fetch_pdf_url_from_unpaywall(doi_val)
+                                    try:
+                                        pdf_url = fetch_pdf_url_from_unpaywall(
+                                            doi_val, raise_on_error=True
+                                        )
+                                    except Exception as exc:
+                                        st.warning(
+                                            f"Unpaywall検索に失敗しました。J-STAGEも確認します: {exc}"
+                                        )
                                 if not pdf_url and url_val:
                                     pdf_url = get_jstage_pdf_url(url_val)
                                 
@@ -1142,8 +1212,10 @@ if page == "📄 論文一覧":
                                     save_path = os.path.join(PDF_DIR, new_filename)
                                     
                                     with st.spinner("PDFダウンロード中..."):
-                                        success = download_pdf_file(pdf_url, save_path)
-                                        if success:
+                                        try:
+                                            download_pdf_file(
+                                                pdf_url, save_path, raise_on_error=True
+                                            )
                                             with get_connection() as conn:
                                                 conn.execute("UPDATE papers SET local_pdf_path = ?, is_read = 1 WHERE id = ?", (save_path, p_id))
                                             
@@ -1160,8 +1232,8 @@ if page == "📄 論文一覧":
                                             
                                             st.session_state[exp_key] = True
                                             st.rerun()
-                                        else:
-                                            st.error("PDFのダウンロードに失敗しました（オープンアクセスでないか、リンクが切れている可能性があります）。")
+                                        except Exception as exc:
+                                            st.error(f"PDFの取得に失敗しました。リンクを確認して再試行してください: {exc}")
                                             st.session_state[exp_key] = True
                                 else:
                                     st.warning("オープンアクセスのPDF直リンクが見つかりませんでした。手動でアップロードするか、ファイルを選択してください。")
@@ -1229,7 +1301,406 @@ if page == "📄 論文一覧":
 
 
 # ============================================================
-# 2: 研究者プロファイル
+# 2: 自分の論文から関連文献を探索
+# ============================================================
+
+elif page == "🧭 自分の論文から探す":
+    st.subheader("🧭 自分の論文から関連文献を探す")
+    st.warning(
+        "解析時に基準論文の抽出テキスト、候補論文のタイトル・著者・抄録をGemini APIへ送信します。"
+    )
+
+    with get_connection() as conn:
+        baseline_row = conn.execute(
+            "SELECT * FROM research_baseline WHERE id = 1"
+        ).fetchone()
+
+    uploaded_baseline = st.file_uploader(
+        "基準にする自分の論文PDF",
+        type=["pdf"],
+        help="新しいPDFを登録すると、現在の基準論文を差し替えます。",
+        key="research_baseline_pdf",
+    )
+    baseline_title_input = st.text_input(
+        "論文タイトル",
+        value=(
+            os.path.splitext(uploaded_baseline.name)[0]
+            if uploaded_baseline else ""
+        ),
+        key="research_baseline_title",
+    )
+    analyze_baseline = st.button(
+        "基準論文を保存して解析",
+        type="primary",
+        disabled=uploaded_baseline is None,
+        key="save_research_baseline",
+    )
+
+    if analyze_baseline and uploaded_baseline is not None:
+        baseline_bytes = uploaded_baseline.getvalue()
+        if not baseline_bytes.startswith(b"%PDF"):
+            st.error("選択されたファイルは有効なPDFとして認識できません。")
+        else:
+            os.makedirs(PDF_DIR, exist_ok=True)
+            digest = hashlib.sha256(baseline_bytes).hexdigest()[:16]
+            baseline_path = os.path.join(PDF_DIR, f"research_baseline_{digest}.pdf")
+            try:
+                with open(baseline_path, "wb") as baseline_file:
+                    baseline_file.write(baseline_bytes)
+                baseline_title = baseline_title_input.strip() or uploaded_baseline.name
+                with st.spinner("基準論文の全文を読み取り、重要語と参考文献の研究者を抽出中..."):
+                    extraction = analyze_research_baseline(
+                        baseline_title,
+                        baseline_path,
+                        extract_full_pdf_text,
+                        call_gemini_with_retry,
+                    )
+                    if not extraction["keywords"] and not extraction["concepts"] and not extraction["researchers"]:
+                        raise ValueError("検索に使えるキーワード・概念・研究者を抽出できませんでした。")
+                    with get_connection() as conn:
+                        save_research_baseline(
+                            conn, baseline_title, baseline_path, extraction
+                        )
+                st.success("基準論文を登録し、解析結果を保存しました。")
+                st.rerun()
+            except Exception as exc:
+                st.error(f"基準論文を解析できませんでした: {exc}")
+
+    if not baseline_row:
+        st.info("最初に基準にする論文PDFを登録してください。")
+    else:
+        try:
+            analysis = normalize_extraction(json.loads(baseline_row["analysis_json"] or "{}"))
+        except (json.JSONDecodeError, TypeError, ValueError) as exc:
+            analysis = {"research_question": "", "keywords": [], "concepts": [], "researchers": []}
+            st.error(f"保存された解析結果を読み取れません: {exc}")
+
+        st.markdown(f"**基準論文:** {baseline_row['title']}")
+        st.caption(f"登録PDF: {os.path.basename(baseline_row['local_pdf_path'])}")
+        st.markdown("#### 抽出内容の確認・編集")
+
+        reference_names = [
+            researcher["name"] for researcher in analysis["researchers"]
+            if "参考文献" in researcher["role"]
+        ]
+        with st.form("edit_research_baseline_analysis"):
+            edited_question = st.text_area(
+                "研究課題",
+                value=analysis["research_question"],
+            )
+            edited_keywords = st.text_area(
+                "重要キーワード（1行に1つ）",
+                value="\n".join(analysis["keywords"]),
+            )
+            edited_concepts = st.text_area(
+                "理論・概念（1行に1つ）",
+                value="\n".join(analysis["concepts"]),
+            )
+            edited_reference_names = st.text_area(
+                "参考文献に出てくる研究者（1行に1人）",
+                value="\n".join(reference_names),
+            )
+            save_analysis = st.form_submit_button("抽出内容を保存")
+
+        if save_analysis:
+            updated_analysis = {
+                "research_question": edited_question.strip(),
+                "keywords": list(dict.fromkeys(
+                    line.strip() for line in edited_keywords.splitlines() if line.strip()
+                )),
+                "concepts": list(dict.fromkeys(
+                    line.strip() for line in edited_concepts.splitlines() if line.strip()
+                )),
+                "researchers": [
+                    {"name": name, "role": "参考文献", "evidence": "利用者が確認"}
+                    for name in dict.fromkeys(
+                        line.strip() for line in edited_reference_names.splitlines() if line.strip()
+                    )
+                ],
+            }
+            with get_connection() as conn:
+                update_research_baseline_analysis(
+                    conn, updated_analysis
+                )
+            st.success("抽出内容を保存しました。")
+            st.rerun()
+
+        available_keywords = list(dict.fromkeys(analysis["keywords"] + analysis["concepts"]))
+        available_researchers = list(dict.fromkeys(
+            researcher["name"] for researcher in analysis["researchers"]
+        ))
+        st.markdown("#### CiNiiから関連候補を収集")
+        if not available_keywords and not available_researchers:
+            st.warning("検索に使えるキーワード・概念・研究者がありません。抽出内容を編集してください。")
+        else:
+            selected_keywords = st.multiselect(
+                "検索するキーワード・概念（最大5件）",
+                available_keywords,
+                default=available_keywords[:5],
+                key=f"discovery_keywords_{baseline_row['updated_at']}",
+            )
+            selected_researchers = st.multiselect(
+                "著者検索する研究者（最大5件）",
+                available_researchers,
+                default=available_researchers[:5],
+                key=f"discovery_researchers_{baseline_row['updated_at']}",
+            )
+            st.caption("各検索条件から最大30件を取得します。PDFはこの段階ではダウンロードしません。")
+            if len(selected_keywords) > 5 or len(selected_researchers) > 5:
+                st.error("検索負荷を抑えるため、キーワード・研究者はそれぞれ最大5件にしてください。")
+            elif st.button(
+                "CiNiiで候補を検索・関連度判定",
+                type="primary",
+                disabled=not (selected_keywords or selected_researchers),
+            ):
+                try:
+                    with st.spinner("CiNiiから候補を収集しています..."):
+                        candidates, search_failures = search_discovery_candidates(
+                            selected_keywords,
+                            selected_researchers,
+                            fetch_papers_from_cinii_api,
+                        )
+                    total_candidate_count = len(candidates)
+                    own_title = normalize_title(baseline_row["title"])
+                    candidates = [
+                        candidate for candidate in candidates
+                        if normalize_title(candidate.get("title", "")) != own_title
+                    ]
+                    candidates.sort(
+                        key=lambda candidate: (
+                            len(candidate.get("matched_terms", [])),
+                            bool(candidate.get("abstract")),
+                        ),
+                        reverse=True,
+                    )
+                    candidates = candidates[:100]
+                    if not candidates:
+                        st.warning("CiNiiから候補文献が見つかりませんでした。")
+                    else:
+                        baseline_context = build_baseline_context(
+                            baseline_row["title"], analysis
+                        )
+                        with get_connection() as conn:
+                            ignored_titles = {
+                                normalize_title(row["title"])
+                                for row in conn.execute(
+                                    "SELECT title FROM ignored_papers"
+                                ).fetchall()
+                            }
+                            candidates = [
+                                candidate for candidate in candidates
+                                if normalize_title(candidate["title"]) not in ignored_titles
+                            ]
+                            run_id = create_discovery_run(
+                                conn,
+                                baseline_row["updated_at"],
+                                {
+                                    "keywords": selected_keywords,
+                                    "researchers": selected_researchers,
+                                },
+                                candidates,
+                            )
+                        with st.spinner(f"{len(candidates)}件の候補を関連度判定中..."):
+                            evaluations, evaluation_failures = evaluate_discovery_candidates(
+                                baseline_context, candidates
+                            )
+                        with get_connection() as conn:
+                            save_candidate_evaluations(
+                                conn,
+                                candidates,
+                                evaluations,
+                                evaluation_failures,
+                                run_id=run_id,
+                            )
+                        evaluated_count = len(evaluations)
+                        failed_count = len(evaluation_failures)
+                        if failed_count:
+                            st.warning(
+                                f"{evaluated_count}件は関連度判定済み、{failed_count}件はGeminiの一時エラーで未判定です。"
+                                "候補は保存されているので、下の「未判定候補を再判定」から再試行できます。"
+                            )
+                        else:
+                            st.success(f"{evaluated_count}件の候補を評価しました。")
+                        if total_candidate_count > 100:
+                            st.info("候補が100件を超えたため、最初の100件を評価しました。検索条件を絞ると候補を入れ替えられます。")
+                        if search_failures:
+                            st.warning("一部の検索条件で取得エラーがありました:\n" + "\n".join(search_failures))
+                        st.rerun()
+                except Exception as exc:
+                    st.error(f"候補の検索・関連度判定に失敗しました: {exc}")
+
+        with get_connection() as conn:
+            available_runs = get_discovery_runs(conn, baseline_row["updated_at"])
+
+        latest_run = None
+        if available_runs:
+            available_run_ids = [row["id"] for row in available_runs]
+            runs_by_id = {row["id"]: row for row in available_runs}
+            selected_run_id = st.selectbox(
+                "この基準論文の検索履歴",
+                available_run_ids,
+                format_func=lambda run_id: (
+                    f"#{run_id} — {runs_by_id[run_id]['created_at']}"
+                ),
+                key=f"discovery_run_{baseline_row['updated_at']}",
+            )
+            latest_run = runs_by_id[selected_run_id]
+            run_candidates = get_discovery_candidates(conn, latest_run["id"])
+
+        if latest_run:
+            st.markdown(f"#### 候補一覧（検索日時: {latest_run['created_at']}）")
+            with get_connection() as conn:
+                retryable_rows = [
+                    dict(candidate)
+                    for candidate in get_candidates_ready_for_evaluation_retry(
+                        conn, latest_run["id"]
+                    )
+                ]
+            if retryable_rows:
+                st.warning(
+                    f"Gemini APIの一時エラーで未判定の候補が{len(retryable_rows)}件あります。"
+                    "CiNii検索をやり直さず、保存済みの候補だけ再判定できます。"
+                )
+                if st.button(
+                    "未判定候補を再判定",
+                    key=f"retry_discovery_{latest_run['id']}",
+                ):
+                    retry_candidates = []
+                    for candidate in retryable_rows:
+                        candidate["matched_terms"] = json.loads(
+                            candidate["matched_terms_json"] or "[]"
+                        )
+                        retry_candidates.append(candidate)
+                    baseline_context = build_baseline_context(
+                        baseline_row["title"], analysis
+                    )
+                    with st.spinner(f"{len(retry_candidates)}件を再判定中..."):
+                        evaluations, evaluation_failures = evaluate_discovery_candidates(
+                            baseline_context, retry_candidates
+                        )
+                    with get_connection() as conn:
+                        save_candidate_evaluations(
+                            conn,
+                            retry_candidates,
+                            evaluations,
+                            evaluation_failures,
+                        )
+                    if evaluation_failures:
+                        st.warning(
+                            f"{len(evaluations)}件を判定し、{len(evaluation_failures)}件はまだ未判定です。"
+                            "時間をおいて再試行してください。"
+                        )
+                    else:
+                        st.success(f"{len(evaluations)}件の再判定が完了しました。")
+                    st.rerun()
+
+            st.caption(
+                "A:内容・研究者の両方が強く関連 / B:一方が強い、または両方に明確な関連 / "
+                "C:一方に限定的な関連 / D:どちらも有意な関連なし。"
+                "PDF取得を選べるのはA・Bのみです。判定材料不足は等級を付けません。"
+            )
+            grade_filter = st.selectbox(
+                "関連度で絞り込み",
+                ["すべて", "A", "B", "C", "D", "判定材料不足"],
+                key=f"discovery_grade_filter_{latest_run['id']}",
+            )
+            filtered_candidates = filter_discovery_candidates(
+                run_candidates, grade_filter
+            )
+            st.caption(f"表示中: {len(filtered_candidates)} / {len(run_candidates)} 件")
+            for candidate in filtered_candidates:
+                candidate = dict(candidate)
+                candidate_id = candidate["id"]
+                terms = ", ".join(json.loads(candidate["matched_terms_json"] or "[]"))
+                grade = "判定材料不足" if candidate["is_insufficient"] else candidate["grade"]
+                selected = st.checkbox(
+                    f"[{grade or '判定材料不足'}] {candidate['title']} — {candidate['first_author'] or candidate['author'] or '著者不明'} ({candidate['pub_date'] or '年不明'})",
+                    value=bool(candidate["is_selected"]),
+                    disabled=not is_pdf_candidate_eligible(
+                        candidate["grade"], bool(candidate["is_insufficient"])
+                    ),
+                    key=f"discovery_candidate_{candidate_id}",
+                )
+                if selected != bool(candidate["is_selected"]):
+                    with get_connection() as conn:
+                        set_discovery_candidate_selected(
+                            conn, candidate_id, selected
+                        )
+                with st.expander("判定根拠・書誌情報", expanded=False):
+                    st.markdown(f"**内容との関連:** {candidate['content_reason'] or '根拠なし'}")
+                    st.markdown(f"**研究者との関連:** {candidate['researcher_reason'] or '根拠なし'}")
+                    if candidate["is_insufficient"]:
+                        st.warning(candidate["insufficient_reason"] or "抄録等の判定材料が不足しています。")
+                    st.caption(f"検索語: {terms or '不明'}")
+                    if candidate["abstract"]:
+                        st.write(candidate["abstract"])
+                    if candidate["url"]:
+                        st.link_button("CiNiiの書誌情報を開く", candidate["url"])
+                    if candidate["processing_status"] != "候補":
+                        st.info(
+                            f"処理状態: {candidate['processing_status']}"
+                            + (f" — {candidate['processing_error']}" if candidate["processing_error"] else "")
+                        )
+
+            with get_connection() as conn:
+                ready_rows, completed_selected_count = (
+                    get_discovery_processing_status(conn, latest_run["id"])
+                )
+                selected_rows = [dict(row) for row in ready_rows]
+            selected_count = len(selected_rows)
+            if completed_selected_count:
+                st.caption(
+                    f"選択済みの完了項目 {completed_selected_count} 件は再処理対象から除外します。"
+                )
+
+            if selected_count > MAX_PDF_BATCH_SIZE:
+                st.error(
+                    f"未完了の選択項目が{selected_count}件あります。"
+                    f"1回の処理は最大{MAX_PDF_BATCH_SIZE}件です。"
+                )
+            elif st.button(
+                f"未完了の選択した{selected_count}件をPDF取得・要約",
+                type="primary",
+                disabled=selected_count == 0,
+            ):
+                try:
+                    validate_pdf_batch_size(len(selected_rows))
+                except ValueError as exc:
+                    st.error(str(exc))
+                    st.stop()
+                progress = st.progress(0.0)
+                completed = 0
+                failures = []
+                for index, candidate in enumerate(selected_rows, start=1):
+                    progress.progress((index - 1) / len(selected_rows))
+                    with st.spinner(f"({index}/{len(selected_rows)}) {candidate['title']} をPDF取得・要約中..."):
+                        paper_id, error_message = process_discovery_candidate(
+                            candidate,
+                            get_connection,
+                            PDF_DIR,
+                            fetch_pdf_url_from_unpaywall,
+                            get_jstage_pdf_url,
+                            download_pdf_file,
+                            summarize_full_pdf_with_gemini,
+                            on_warning=st.warning,
+                        )
+                    if error_message:
+                        failures.append(f"{candidate['title']}: {error_message}")
+                    else:
+                        completed += 1
+                    progress.progress(index / len(selected_rows))
+                if failures:
+                    st.warning(
+                        f"{completed}件は処理完了、{len(failures)}件は失敗しました。\n"
+                        + "\n".join(failures)
+                    )
+                else:
+                    st.success(f"{completed}件のPDF取得・要約が完了しました。")
+                st.rerun()
+
+
+# ============================================================
+# 3: 研究者プロファイル
 # ============================================================
 
 elif page == "👤 研究者プロファイル":
@@ -1766,16 +2237,3 @@ elif page == "⚙️ 著者・キーワード管理":
             kc1.markdown(f"- **{k_word}**")
             if kc2.button("削除", key=f"del_k_{idx}_{k_word}", on_click=delete_keyword, args=(k_word,)):
                 st.rerun()
-
-
-# ============================================================
-# 初回起動時の初期化実行
-# ============================================================
-
-@st.cache_resource
-def initialize_app_database():
-    init_db(clear_papers_only=False)
-    # 起動時ハングを防止するためクレンジングは無効化
-    # clean_all_database()
-
-initialize_app_database()

@@ -4,7 +4,7 @@ from bs4 import BeautifulSoup
 
 APP_ID = "AXGGAvFMJbYaP3WY5tNz"
 
-def test_cinii_exact_spec():
+def run_cinii_exact_spec_smoke_test():
     author_name = "坂倉 杏介"
     encoded_author = urllib.parse.quote(author_name)
     
@@ -56,4 +56,4 @@ def test_cinii_exact_spec():
         print(f"❌ エラー: {e}")
 
 if __name__ == "__main__":
-    test_cinii_exact_spec()
+    run_cinii_exact_spec_smoke_test()
