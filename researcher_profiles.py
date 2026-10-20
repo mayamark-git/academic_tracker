@@ -1,5 +1,6 @@
 import json
 import re
+import sqlite3
 from typing import Any, Callable
 
 
@@ -108,10 +109,47 @@ def fetch_researcher_profile_with_ai(
         )
         return parse_robust_json_profile(text, sanitize_society_name)
     except Exception as exc:
-        print(f"fetch_researcher_profile_with_ai error for {clean_author}: {exc}")
-        return {
-            "field": "",
-            "school_of_thought": "",
-            "key_concepts": "",
-            "academic_societies": "",
-        }
+        raise RuntimeError(
+            f"研究者「{clean_author}」のプロフィールを取得できませんでした: {exc}"
+        ) from exc
+
+
+def merge_researcher_profile(
+    existing: dict[str, Any] | None,
+    fetched: dict[str, Any],
+) -> dict[str, str]:
+    fields = ("field", "school_of_thought", "key_concepts", "academic_societies")
+    return {
+        field: str(fetched.get(field) or "").strip()
+        or str((existing or {}).get(field) or "").strip()
+        for field in fields
+    }
+
+
+def save_fetched_researcher_profile(
+    conn: sqlite3.Connection,
+    name: str,
+    fetched: dict[str, Any],
+) -> bool:
+    fields = ("field", "school_of_thought", "key_concepts", "academic_societies")
+    if not any(str(fetched.get(field) or "").strip() for field in fields):
+        return False
+
+    existing_row = conn.execute(
+        """SELECT field, school_of_thought, key_concepts, academic_societies
+        FROM researcher_profiles WHERE name = ?""",
+        (name,),
+    ).fetchone()
+    existing = dict(existing_row) if existing_row else None
+    merged = merge_researcher_profile(existing, fetched)
+    conn.execute("""
+        INSERT INTO researcher_profiles (
+            name, field, school_of_thought, key_concepts, academic_societies
+        ) VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(name) DO UPDATE SET
+            field = excluded.field,
+            school_of_thought = excluded.school_of_thought,
+            key_concepts = excluded.key_concepts,
+            academic_societies = excluded.academic_societies
+    """, (name, *(merged[field] for field in fields)))
+    return True

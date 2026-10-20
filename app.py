@@ -55,6 +55,7 @@ from research_discovery import (
 )
 from researcher_profiles import (
     fetch_researcher_profile_with_ai as fetch_researcher_profile,
+    save_fetched_researcher_profile,
 )
 
 import streamlit as st
@@ -1642,28 +1643,34 @@ elif page == "👤 研究者プロファイル":
                 st.warning("登録されている対象研究者がいません。「⚙️ 著者・キーワード管理」から追加してください。")
             else:
                 updated_cnt = 0
+                failed_authors = []
                 with st.spinner(f"登録中の研究者 {len(all_authors)} 名のプロファイルをWeb検索中..."):
                     for a_name in all_authors:
                         try:
                             prof_data = fetch_researcher_profile_with_ai(a_name)
-                            if prof_data.get("field") or prof_data.get("school_of_thought") or prof_data.get("academic_societies"):
-                                with get_connection() as conn:
-                                    conn.execute("""
-                                        INSERT INTO researcher_profiles (name, field, school_of_thought, key_concepts, academic_societies)
-                                        VALUES (?, ?, ?, ?, ?)
-                                        ON CONFLICT(name) DO UPDATE SET
-                                            field = excluded.field,
-                                            school_of_thought = excluded.school_of_thought,
-                                            key_concepts = excluded.key_concepts,
-                                            academic_societies = excluded.academic_societies
-                                    """, (a_name, prof_data["field"], prof_data["school_of_thought"], prof_data["key_concepts"], prof_data["academic_societies"]))
+                            with get_connection() as conn:
+                                profile_saved = save_fetched_researcher_profile(
+                                    conn, a_name, prof_data
+                                )
+                            if profile_saved:
                                 updated_cnt += 1
+                            else:
+                                failed_authors.append(
+                                    f"{a_name}: 有効なプロフィール情報が取得できませんでした"
+                                )
                             time.sleep(2)
                         except Exception as e:
-                            print(f"Error fetching {a_name}: {e}")
+                            failed_authors.append(f"{a_name}: {e}")
 
                 sync_all_bidirectional_societies()
-                st.success(f"登録中の {updated_cnt} 名の研究者情報を更新し、所属学会データベースとも自動同期しました。")
+                st.success(
+                    f"{updated_cnt} 名の研究者情報を更新し、所属学会データベースとも自動同期しました。"
+                )
+                if failed_authors:
+                    st.warning(
+                        f"{len(failed_authors)} 名の情報を更新できませんでした:\n"
+                        + "\n".join(failed_authors)
+                    )
                 st.rerun()
 
     with get_connection() as conn:
