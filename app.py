@@ -53,6 +53,9 @@ from research_discovery import (
     update_research_baseline_analysis,
     validate_pdf_batch_size,
 )
+from researcher_profiles import (
+    fetch_researcher_profile_with_ai as fetch_researcher_profile,
+)
 
 import streamlit as st
 
@@ -447,96 +450,13 @@ def summarize_full_pdf_with_gemini(paper_title, pdf_path):
     return call_gemini_with_retry(final_prompt)
 
 
-def parse_robust_json_profile(raw_text: str) -> dict:
-    result = {
-        "field": "",
-        "school_of_thought": "",
-        "key_concepts": "",
-        "academic_societies": ""
-    }
-    if not raw_text:
-        return result
-
-    json_match = re.search(r'\{[\s\S]*\}', raw_text)
-    json_str = json_match.group(0) if json_match else raw_text.strip()
-
-    parsed_data = None
-    try:
-        parsed_data = json.loads(json_str)
-    except Exception:
-        for key in ["field", "school_of_thought", "key_concepts", "academic_societies"]:
-            pattern = rf'"{key}"\s*:\s*"([^"]+)"'
-            m = re.search(pattern, raw_text)
-            if m:
-                result[key] = m.group(1).strip()
-            else:
-                m_list = re.search(rf'"{key}"\s*:\s*\[([\s\S]*?)\]', raw_text)
-                if m_list:
-                    items = re.findall(r'"([^"]+)"', m_list.group(1))
-                    result[key] = ", ".join([it.strip() for it in items if it.strip()])
-
-    if isinstance(parsed_data, dict):
-        result["field"] = str(parsed_data.get("field", "") or "").strip()
-        result["school_of_thought"] = str(parsed_data.get("school_of_thought", "") or "").strip()
-
-        kc = parsed_data.get("key_concepts", "")
-        if isinstance(kc, list):
-            result["key_concepts"] = ", ".join([str(x).strip() for x in kc if str(x).strip()])
-        else:
-            result["key_concepts"] = str(kc or "").strip()
-
-        soc = parsed_data.get("academic_societies", "")
-        if isinstance(soc, list):
-            soc_items = []
-            for item in soc:
-                if isinstance(item, dict):
-                    name_val = item.get("name", "") or item.get("society_name", "")
-                    s = sanitize_society_name(str(name_val))
-                else:
-                    s = sanitize_society_name(str(item))
-                if s and s not in {"不明", "なし", "特になし", "情報なし"}:
-                    soc_items.append(s)
-            result["academic_societies"] = ", ".join(list(dict.fromkeys(soc_items)))
-        elif isinstance(soc, str):
-            soc_items = [sanitize_society_name(s) for s in re.split(r'[,、\n/;]', soc) if s.strip()]
-            valid_items = [s for s in soc_items if s and s not in {"不明", "なし", "特になし", "情報なし"}]
-            result["academic_societies"] = ", ".join(list(dict.fromkeys(valid_items)))
-
-    return result
-
-
-def fetch_researcher_profile_with_ai(author_name: str) -> dict:
-    clean_author = sanitize_name(author_name)
-    prompt = f"""あなたは学術研究者のプロフィール調査・情報構造化を行うリサーチエージェントです。
-
-対象研究者: {clean_author}
-
-以下の検索クエリ等を駆使してWeb検索を行い、客観的な所属・専攻・所属学会情報を調査してください。
-1. "{clean_author}" "大学"
-2. "{clean_author}" "学会"
-3. "{clean_author}" "researchmap"
-4. "{clean_author}" 専門 研究 分野
-
-【出力フォーマット】
-必ず有効なJSONのみを出力してください。
-{{
-  "field": "専門分野・研究領域（例：社会学、都市計画、文化人類学など）",
-  "school_of_thought": "学問的潮流・学派・アプローチ",
-  "key_concepts": "主要キーワード（カンマ区切りで3〜5個程度）",
-  "academic_societies": "所属学会名（カンマ区切りで正式名称を列挙）"
-}}
-"""
-    try:
-        text = call_gemini_with_google_search(prompt, preferred_model="gemini-3.6-flash")
-        return parse_robust_json_profile(text)
-    except Exception as e:
-        print(f"fetch_researcher_profile_with_ai error for {clean_author}: {e}")
-        return {
-            "field": "",
-            "school_of_thought": "",
-            "key_concepts": "",
-            "academic_societies": ""
-        }
+def fetch_researcher_profile_with_ai(author_name: str) -> dict[str, str]:
+    return fetch_researcher_profile(
+        author_name,
+        sanitize_name,
+        sanitize_society_name,
+        call_gemini_with_google_search,
+    )
 
 
 def ai_research_for_researcher(author_name: str, current_field: str = "") -> str:
