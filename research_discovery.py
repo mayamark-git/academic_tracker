@@ -454,8 +454,18 @@ def get_candidates_ready_for_evaluation_retry(
     retry_reason_prefix = "AI判定エラー:"
     return conn.execute(
         """SELECT * FROM discovery_candidates
-        WHERE run_id = ? AND is_insufficient = 1
-        AND substr(insufficient_reason, 1, ?) = ?
+        WHERE run_id = ?
+        AND (
+            (grade = '' AND is_insufficient = 0)
+            OR (
+                is_insufficient = 1
+                AND (
+                    insufficient_reason = 'AI判定待ち'
+                    OR insufficient_reason = 'AIから判定結果が返されませんでした。'
+                    OR substr(insufficient_reason, 1, ?) = ?
+                )
+            )
+        )
         ORDER BY CASE grade
             WHEN 'A' THEN 0 WHEN 'B' THEN 1
             WHEN 'C' THEN 2 WHEN 'D' THEN 3 ELSE 4 END,
@@ -464,14 +474,32 @@ def get_candidates_ready_for_evaluation_retry(
     ).fetchall()
 
 
+def get_candidate_evaluation_label(candidate: Any) -> str:
+    grade = str(candidate["grade"] or "").strip()
+    if grade and not candidate["is_insufficient"]:
+        return grade
+
+    reason = str(candidate["insufficient_reason"] or "")
+    if reason == "AI判定待ち" or (
+        not candidate["is_insufficient"] and not grade
+    ):
+        return "判定待ち"
+    if reason.startswith("AI判定エラー:") or reason == "AIから判定結果が返されませんでした。":
+        return "判定エラー"
+    return "判定材料不足" if candidate["is_insufficient"] else "判定待ち"
+
+
 def filter_discovery_candidates(
     candidates: list[sqlite3.Row],
     grade_filter: str,
 ) -> list[sqlite3.Row]:
     if grade_filter == "すべて":
         return candidates
-    if grade_filter == "判定材料不足":
-        return [candidate for candidate in candidates if candidate["is_insufficient"]]
+    if grade_filter in {"判定待ち", "判定エラー", "判定材料不足"}:
+        return [
+            candidate for candidate in candidates
+            if get_candidate_evaluation_label(candidate) == grade_filter
+        ]
     if grade_filter in {"A", "B", "C", "D"}:
         return [
             candidate for candidate in candidates
@@ -498,7 +526,7 @@ def create_discovery_run(
                 run_id, title, author, first_author, journal, pub_date,
                 url, doi, abstract, matched_terms_json, insufficient_reason,
                 is_insufficient
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
         """, (
             run_id,
             candidate["title"],
@@ -710,7 +738,15 @@ def parse_relevance_response(
             }
             continue
 
-        insufficient = bool(item.get("insufficient", False))
+        raw_insufficient = item.get("insufficient", False)
+        if isinstance(raw_insufficient, bool):
+            insufficient = raw_insufficient
+        elif isinstance(raw_insufficient, str) and raw_insufficient.strip().casefold() in {
+            "true", "false",
+        }:
+            insufficient = raw_insufficient.strip().casefold() == "true"
+        else:
+            insufficient = True
         grade = str(item.get("grade", "")).strip().upper()
         if insufficient or grade not in {"A", "B", "C", "D"}:
             grade = ""
@@ -718,15 +754,15 @@ def parse_relevance_response(
         content_reason = str(item.get("content_reason", "")).strip()
         researcher_reason = str(item.get("researcher_reason", "")).strip()
         insufficient_reason = str(item.get("insufficient_reason", "")).strip()
-        if not content_reason or not researcher_reason:
+        if not content_reason:
             grade = ""
             insufficient = True
-            insufficient_reason = insufficient_reason or "関連度の判定根拠が不足しています。"
+            insufficient_reason = insufficient_reason or "論文内容に基づく判定理由がありません。"
 
         results[candidate_id] = {
             "grade": grade,
             "content_reason": content_reason,
-            "researcher_reason": researcher_reason,
+            "researcher_reason": researcher_reason or "研究者関連の根拠なし",
             "insufficient_reason": insufficient_reason,
             "insufficient": insufficient,
         }
@@ -791,11 +827,14 @@ def build_relevance_prompt(
         for index, candidate in enumerate(candidates)
     ]
     return f"""あなたは学術文献の関連性を判定します。基準論文と各候補について、入力された情報だけを根拠に判定してください。
-基準論文の研究内容との意味的な近さと、基準論文から抽出した重要研究者が候補著者に含まれるかを同じ重みで評価してください。
-研究者名の一致は候補の著者欄に確認できる場合のみ認め、検索語に使われたというだけで一致としないでください。
-タイトル・抄録や候補著者欄がなく、2軸を公正に評価できない場合は、低い等級を推測せず insufficient=true としてください。
-等級は内容と研究者の2軸を同じ重みで統合してください。Aは両軸とも明確に強い、Bは一方が強いか両方に明確な関連がある、
-Cは一方に限られた関連がある、Dは両軸とも有意な関連が見られない場合です。
+等級は候補論文のタイトルと抄録に基づく研究内容の関連性を主軸に判定してください。研究者名の一致は補足情報として扱い、
+研究者が一致しないことだけを理由に内容の関連性を下げないでください。研究者名の一致は候補の著者欄に確認できる場合のみ認め、
+検索語に使われたというだけで一致としないでください。候補著者が空欄でも、タイトルや抄録で内容を評価できるなら判定してください。
+タイトルのみの場合も、その記述から関連性を評価できるなら判定し、抄録がないという理由だけで insufficient=true にしないでください。
+タイトル・抄録のどちらもなく、内容との関連性を評価できない場合に限り insufficient=true としてください。
+Aは研究課題・対象・概念が非常に明確に一致、Bは直接的で明確な関連、Cは部分的・周辺的な関連、
+Dはタイトル・抄録から有意な関連が見られない場合です。情報が少ない場合は判定理由にその制約を明記してください。
+researcher_reasonには著者情報がない場合「著者情報なし」、著者情報があるが一致しない場合は「確認できる一致なし」と記してください。
 JSON以外の文章は出力しないでください。
 
 基準論文:
@@ -811,7 +850,7 @@ JSON以外の文章は出力しないでください。
       "candidate_id": "入力と同じID",
       "grade": "A / B / C / D",
       "content_reason": "研究内容の近さと抄録等の根拠",
-      "researcher_reason": "著者欄と基準論文の重要研究者との一致。なければ一致なしと明記",
+      "researcher_reason": "著者欄と基準論文の重要研究者との一致。著者情報なしの場合はその旨を記載",
       "insufficient": false,
       "insufficient_reason": ""
     }}

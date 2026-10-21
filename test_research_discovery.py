@@ -15,6 +15,7 @@ from research_discovery import (
     deduplicate_candidates,
     evaluate_candidate_batches,
     filter_discovery_candidates,
+    get_candidate_evaluation_label,
     get_candidates_ready_for_evaluation_retry,
     get_discovery_processing_status,
     get_discovery_candidates,
@@ -167,7 +168,9 @@ class ResearchDiscoveryTests(unittest.TestCase):
             connection, "baseline-one", {}, [
                 {"title": "zeta", "matched_terms": []},
                 {"title": "Alpha", "matched_terms": []},
-                {"title": "Insufficient", "matched_terms": []},
+                {"title": "Error", "matched_terms": []},
+                {"title": "Material", "matched_terms": []},
+                {"title": "Pending", "matched_terms": []},
             ],
         )
         second_run = create_discovery_run(
@@ -187,20 +190,16 @@ class ResearchDiscoveryTests(unittest.TestCase):
             (first_run,),
         )
         connection.execute(
-            """UPDATE discovery_candidates SET grade = 'A', is_insufficient = 1
-            WHERE run_id = ? AND title = 'Insufficient'""",
+            """UPDATE discovery_candidates SET is_insufficient = 1,
+            insufficient_reason = '判定可能な抄録がありません。'
+            WHERE run_id = ? AND title = 'Material'""",
             (first_run,),
         )
         connection.execute(
             """UPDATE discovery_candidates
-            SET insufficient_reason = 'AI判定エラー: temporary failure'
-            WHERE run_id = ? AND title = 'Insufficient'""",
-            (first_run,),
-        )
-        connection.execute(
-            """UPDATE discovery_candidates
-            SET insufficient_reason = 'AI判定待ち'
-            WHERE run_id = ? AND title = 'Alpha'""",
+            SET is_insufficient = 1,
+                insufficient_reason = 'AI判定エラー: temporary failure'
+            WHERE run_id = ? AND title = 'Error'""",
             (first_run,),
         )
 
@@ -210,7 +209,7 @@ class ResearchDiscoveryTests(unittest.TestCase):
         self.assertEqual([run["id"] for run in runs], [second_run, first_run])
         self.assertEqual(
             [candidate["title"] for candidate in candidates],
-            ["Insufficient", "zeta", "Alpha"],
+            ["zeta", "Alpha", "Error", "Material", "Pending"],
         )
         self.assertEqual(
             [candidate["title"] for candidate in filter_discovery_candidates(candidates, "A")],
@@ -218,11 +217,19 @@ class ResearchDiscoveryTests(unittest.TestCase):
         )
         self.assertEqual(
             [candidate["title"] for candidate in filter_discovery_candidates(candidates, "すべて")],
-            ["Insufficient", "zeta", "Alpha"],
+            ["zeta", "Alpha", "Error", "Material", "Pending"],
         )
         self.assertEqual(
             [candidate["title"] for candidate in filter_discovery_candidates(candidates, "判定材料不足")],
-            ["Insufficient"],
+            ["Material"],
+        )
+        self.assertEqual(
+            [candidate["title"] for candidate in filter_discovery_candidates(candidates, "判定エラー")],
+            ["Error"],
+        )
+        self.assertEqual(
+            [candidate["title"] for candidate in filter_discovery_candidates(candidates, "判定待ち")],
+            ["Pending"],
         )
         self.assertEqual(
             [
@@ -231,7 +238,11 @@ class ResearchDiscoveryTests(unittest.TestCase):
                     connection, first_run
                 )
             ],
-            ["Insufficient"],
+            ["Error", "Pending"],
+        )
+        self.assertEqual(
+            get_candidate_evaluation_label(candidates[-1]),
+            "判定待ち",
         )
         with self.assertRaisesRegex(ValueError, "不明な関連度フィルター"):
             filter_discovery_candidates(candidates, "unknown")
@@ -441,6 +452,31 @@ class ResearchDiscoveryTests(unittest.TestCase):
             "AI判定エラー: temporary Gemini outage",
         )
 
+    def test_new_candidates_are_pending_not_marked_as_insufficient(self):
+        connection = sqlite3.connect(":memory:")
+        self.addCleanup(connection.close)
+        connection.row_factory = sqlite3.Row
+        connection.execute("CREATE TABLE papers (id INTEGER PRIMARY KEY, doi TEXT)")
+        initialize_discovery_schema(connection)
+
+        run_id = create_discovery_run(
+            connection, "baseline", {}, [{"title": "Pending paper"}]
+        )
+
+        candidate = connection.execute(
+            "SELECT * FROM discovery_candidates WHERE run_id = ?",
+            (run_id,),
+        ).fetchone()
+        self.assertEqual(candidate["is_insufficient"], 0)
+        self.assertEqual(candidate["insufficient_reason"], "AI判定待ち")
+        self.assertEqual(get_candidate_evaluation_label(candidate), "判定待ち")
+        self.assertEqual(
+            [row["title"] for row in get_candidates_ready_for_evaluation_retry(
+                connection, run_id
+            )],
+            ["Pending paper"],
+        )
+
     def test_evaluation_retry_updates_candidate_by_id(self):
         connection = sqlite3.connect(":memory:")
         self.addCleanup(connection.close)
@@ -627,6 +663,53 @@ class ResearchDiscoveryTests(unittest.TestCase):
 
         self.assertTrue(result["0"]["insufficient"])
         self.assertEqual(result["0"]["grade"], "")
+
+    def test_content_reason_is_sufficient_without_researcher_reason(self):
+        result = parse_relevance_response(
+            json.dumps({
+                "candidates": [{
+                    "candidate_id": "0",
+                    "grade": "B",
+                    "content_reason": "The abstract directly examines the same process.",
+                    "researcher_reason": "",
+                    "insufficient": False,
+                }]
+            }),
+            [{"title": "Related", "abstract": "Study of the same process."}],
+        )
+
+        self.assertEqual(result["0"]["grade"], "B")
+        self.assertFalse(result["0"]["insufficient"])
+        self.assertEqual(result["0"]["researcher_reason"], "研究者関連の根拠なし")
+
+    def test_string_false_is_not_treated_as_insufficient(self):
+        result = parse_relevance_response(
+            json.dumps({
+                "candidates": [{
+                    "candidate_id": "0",
+                    "grade": "C",
+                    "content_reason": "The topic is partially related.",
+                    "researcher_reason": "No confirmed match.",
+                    "insufficient": "false",
+                }]
+            }),
+            [{"title": "Somewhat related"}],
+        )
+
+        self.assertFalse(result["0"]["insufficient"])
+        self.assertEqual(result["0"]["grade"], "C")
+
+    def test_relevance_prompt_prioritizes_content_and_allows_title_only(self):
+        from research_discovery import build_relevance_prompt
+
+        prompt = build_relevance_prompt(
+            {"title": "Baseline", "keywords": ["community"]},
+            [{"title": "A candidate"}],
+        )
+
+        self.assertIn("研究者名の一致は補足情報", prompt)
+        self.assertIn("抄録がないという理由だけで insufficient=true にしない", prompt)
+        self.assertIn("タイトル・抄録のどちらもなく", prompt)
 
     def test_candidates_are_deduplicated_by_doi_and_normalized_title(self):
         result = deduplicate_candidates([

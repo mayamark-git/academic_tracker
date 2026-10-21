@@ -35,6 +35,7 @@ from research_discovery import (
     create_discovery_run,
     evaluate_candidate_batches,
     filter_discovery_candidates,
+    get_candidate_evaluation_label,
     get_discovery_candidates,
     get_candidates_ready_for_evaluation_retry,
     get_discovery_runs,
@@ -1498,7 +1499,7 @@ elif page == "🧭 自分の論文から探す":
                 ]
             if retryable_rows:
                 st.warning(
-                    f"Gemini APIの一時エラーで未判定の候補が{len(retryable_rows)}件あります。"
+                    f"判定待ちまたは判定エラーの候補が{len(retryable_rows)}件あります。"
                     "CiNii検索をやり直さず、保存済みの候補だけ再判定できます。"
                 )
                 if st.button(
@@ -1535,13 +1536,13 @@ elif page == "🧭 自分の論文から探す":
                     st.rerun()
 
             st.caption(
-                "A:内容・研究者の両方が強く関連 / B:一方が強い、または両方に明確な関連 / "
-                "C:一方に限定的な関連 / D:どちらも有意な関連なし。"
-                "PDF取得を選べるのはA・Bのみです。判定材料不足は等級を付けません。"
+                "等級は論文内容を主軸に判定し、研究者との一致は補足情報として扱います。"
+                "A:非常に強い関連 / B:明確な関連 / C:部分的な関連 / D:有意な関連なし。"
+                "PDF取得を選べるのはA・Bのみです。判定待ち・判定エラー・判定材料不足は別に表示します。"
             )
             grade_filter = st.selectbox(
                 "関連度で絞り込み",
-                ["すべて", "A", "B", "C", "D", "判定材料不足"],
+                ["すべて", "A", "B", "C", "D", "判定待ち", "判定エラー", "判定材料不足"],
                 key=f"discovery_grade_filter_{latest_run['id']}",
             )
             filtered_candidates = filter_discovery_candidates(
@@ -1552,9 +1553,9 @@ elif page == "🧭 自分の論文から探す":
                 candidate = dict(candidate)
                 candidate_id = candidate["id"]
                 terms = ", ".join(json.loads(candidate["matched_terms_json"] or "[]"))
-                grade = "判定材料不足" if candidate["is_insufficient"] else candidate["grade"]
+                evaluation_label = get_candidate_evaluation_label(candidate)
                 selected = st.checkbox(
-                    f"[{grade or '判定材料不足'}] {candidate['title']} — {candidate['first_author'] or candidate['author'] or '著者不明'} ({candidate['pub_date'] or '年不明'})",
+                    f"[{evaluation_label}] {candidate['title']} — {candidate['first_author'] or candidate['author'] or '著者不明'} ({candidate['pub_date'] or '年不明'})",
                     value=bool(candidate["is_selected"]),
                     disabled=not is_pdf_candidate_eligible(
                         candidate["grade"], bool(candidate["is_insufficient"])
@@ -1569,8 +1570,12 @@ elif page == "🧭 自分の論文から探す":
                 with st.expander("判定根拠・書誌情報", expanded=False):
                     st.markdown(f"**内容との関連:** {candidate['content_reason'] or '根拠なし'}")
                     st.markdown(f"**研究者との関連:** {candidate['researcher_reason'] or '根拠なし'}")
-                    if candidate["is_insufficient"]:
+                    if evaluation_label == "判定材料不足":
                         st.warning(candidate["insufficient_reason"] or "抄録等の判定材料が不足しています。")
+                    elif evaluation_label == "判定エラー":
+                        st.warning(candidate["insufficient_reason"] or "AIの判定が完了しませんでした。再判定できます。")
+                    elif evaluation_label == "判定待ち":
+                        st.info("関連度判定がまだ完了していません。上の再判定ボタンを利用してください。")
                     st.caption(f"検索語: {terms or '不明'}")
                     if candidate["abstract"]:
                         st.write(candidate["abstract"])
