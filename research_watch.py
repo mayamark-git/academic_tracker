@@ -336,22 +336,34 @@ def build_gemini_research_watch_adapters(
 
 
 def extract_grounded_sources(response: Any) -> list[dict[str, str]]:
-    candidates = getattr(response, "candidates", None) or []
-    if not candidates:
-        return []
-    metadata = getattr(candidates[0], "grounding_metadata", None)
-    chunks = getattr(metadata, "grounding_chunks", None) or []
     sources = []
     seen_urls = set()
-    for chunk in chunks:
-        web = getattr(chunk, "web", None)
-        if not web:
-            continue
-        url = str(getattr(web, "uri", "") or "").strip()
-        title = str(getattr(web, "title", "") or "").strip()
+
+    def value(item: Any, key: str) -> Any:
+        if isinstance(item, dict):
+            return item.get(key)
+        return getattr(item, key, None)
+
+    def add_source(item: Any, url_key: str) -> None:
+        url = str(value(item, url_key) or "").strip()
+        title = str(value(item, "title") or "").strip()
         if url.startswith(("https://", "http://")) and url not in seen_urls:
             seen_urls.add(url)
             sources.append({"title": title, "url": url})
+
+    candidates = value(response, "candidates") or []
+    for candidate in candidates:
+        metadata = value(candidate, "grounding_metadata")
+        chunks = value(metadata, "grounding_chunks") or []
+        for chunk in chunks:
+            add_source(value(chunk, "web"), "uri")
+
+        citation_metadata = value(
+            value(value(candidate, "content"), "citation_metadata"),
+            "citations",
+        ) or []
+        for citation in citation_metadata:
+            add_source(citation, "uri")
     return sources
 
 

@@ -230,6 +230,46 @@ class ResearchWatchTests(unittest.TestCase):
             [{"title": "Report", "url": "https://agency.example/report"}],
         )
 
+    def test_grounded_sources_accept_sdk_dictionary_shape_and_all_candidates(self):
+        response = {
+            "candidates": [
+                {
+                    "grounding_metadata": {
+                        "grounding_chunks": [{
+                            "web": {
+                                "title": "Grounding result",
+                                "uri": "https://agency.example/grounding",
+                            }
+                        }]
+                    }
+                },
+                {
+                    "content": {
+                        "citation_metadata": {
+                            "citations": [{
+                                "title": "Citation result",
+                                "uri": "https://agency.example/citation",
+                            }]
+                        }
+                    }
+                },
+            ]
+        }
+
+        self.assertEqual(
+            extract_grounded_sources(response),
+            [
+                {
+                    "title": "Grounding result",
+                    "url": "https://agency.example/grounding",
+                },
+                {
+                    "title": "Citation result",
+                    "url": "https://agency.example/citation",
+                },
+            ],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
