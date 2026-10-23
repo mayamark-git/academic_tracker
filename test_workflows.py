@@ -8,6 +8,7 @@ from unittest.mock import patch
 import cron_fetcher
 from database import get_connection, initialize_database
 from research_discovery import (
+    add_discovery_candidate_to_library,
     create_discovery_run,
     get_candidates_ready_for_processing,
     merge_candidate_into_papers,
@@ -220,15 +221,15 @@ class OfflineWorkflowIntegrationTests(unittest.TestCase):
                 on_warning=warning_messages.append,
             )
 
-            self.assertIsNotNone(paper_id)
+            self.assertIsNone(paper_id)
             self.assertEqual(error, "公開PDFの直リンクが見つかりませんでした。")
             with closing(get_connection(db_path)) as connection:
                 failed_row = connection.execute(
                     "SELECT * FROM discovery_candidates WHERE id = ?",
                     (candidate["id"],),
                 ).fetchone()
-                self.assertEqual(failed_row["processing_status"], "失敗")
-                self.assertEqual(failed_row["paper_id"], paper_id)
+                self.assertEqual(failed_row["processing_status"], "PDF未入手")
+                self.assertIsNone(failed_row["paper_id"])
 
             def download_pdf(url, path, **kwargs):
                 os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -252,22 +253,85 @@ class OfflineWorkflowIntegrationTests(unittest.TestCase):
                 on_warning=warning_messages.append,
             )
 
-            self.assertEqual(retry_paper_id, paper_id)
+            self.assertIsNone(retry_paper_id)
             self.assertIsNone(retry_error)
             with closing(get_connection(db_path)) as connection:
                 completed = connection.execute(
-                    """SELECT c.processing_status, c.processing_error,
-                    p.local_pdf_path, p.ai_insight
-                    FROM discovery_candidates c
-                    JOIN papers p ON p.id = c.paper_id
-                    WHERE c.id = ?""",
+                    """SELECT processing_status, processing_error,
+                    local_pdf_path, ai_insight, paper_id
+                    FROM discovery_candidates WHERE id = ?""",
                     (candidate["id"],),
                 ).fetchone()
                 self.assertEqual(completed["processing_status"], "完了")
                 self.assertEqual(completed["processing_error"], "")
                 self.assertTrue(os.path.isfile(completed["local_pdf_path"]))
                 self.assertEqual(completed["ai_insight"], "Verified summary")
+                self.assertIsNone(completed["paper_id"])
+                paper_id = add_discovery_candidate_to_library(
+                    connection, candidate["id"]
+                )
+                library_paper = connection.execute(
+                    "SELECT * FROM papers WHERE id = ?", (paper_id,)
+                ).fetchone()
+                self.assertEqual(
+                    library_paper["local_pdf_path"],
+                    completed["local_pdf_path"],
+                )
+                self.assertEqual(library_paper["ai_insight"], "Verified summary")
             self.assertEqual(warning_messages, [])
+
+    def test_explicit_candidate_import_preserves_existing_user_fields(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = os.path.join(temp_dir, "import.db")
+            with closing(get_connection(db_path, isolation_level=None)) as connection:
+                initialize_database(connection)
+                cursor = connection.execute(
+                    """INSERT INTO papers
+                    (title, doi, user_memo, is_read, local_pdf_path, ai_insight)
+                    VALUES (?, ?, ?, ?, ?, ?)""",
+                    (
+                        "Existing title",
+                        "10.1234/import",
+                        "Keep this note",
+                        1,
+                        "existing.pdf",
+                        "Existing summary",
+                    ),
+                )
+                existing_id = cursor.lastrowid
+                run_id = create_discovery_run(
+                    connection,
+                    "baseline",
+                    {"keywords": ["topic"]},
+                    [{
+                        "title": "New title for same paper",
+                        "doi": "https://doi.org/10.1234/import",
+                        "author": "Researcher",
+                        "abstract": "New abstract",
+                        "matched_terms": ["topic"],
+                    }],
+                )
+                candidate_id = connection.execute(
+                    "SELECT id FROM discovery_candidates WHERE run_id = ?",
+                    (run_id,),
+                ).fetchone()["id"]
+                imported_id = add_discovery_candidate_to_library(
+                    connection, candidate_id
+                )
+                paper = connection.execute(
+                    "SELECT * FROM papers WHERE id = ?", (existing_id,)
+                ).fetchone()
+
+                self.assertEqual(imported_id, existing_id)
+                self.assertEqual(paper["user_memo"], "Keep this note")
+                self.assertEqual(paper["is_read"], 1)
+                self.assertEqual(paper["local_pdf_path"], "existing.pdf")
+                self.assertEqual(paper["ai_insight"], "Existing summary")
+                self.assertEqual(paper["abstract"], "New abstract")
+                self.assertEqual(
+                    connection.execute("SELECT COUNT(*) FROM papers").fetchone()[0],
+                    1,
+                )
 
 
 if __name__ == "__main__":

@@ -5,44 +5,85 @@ import sqlite3
 from contextlib import closing
 from typing import Any, Callable
 
-MAX_PDF_BATCH_SIZE = 10
+MAX_KEYWORD_QUERIES = 5
+MAX_RESEARCHER_QUERIES = 5
+PAPERS_PER_QUERY = 30
 
 
 def search_discovery_candidates(
     keywords: list[str],
     researchers: list[str],
     fetch_papers: Callable[..., list[dict[str, Any]]],
+    on_progress: Callable[[dict[str, Any]], None] | None = None,
 ) -> tuple[list[dict[str, Any]], list[str]]:
     candidates = []
     failures = []
+    clean_keywords = list(dict.fromkeys(
+        str(keyword).strip() for keyword in keywords if str(keyword).strip()
+    ))
+    clean_researchers = list(dict.fromkeys(
+        str(researcher).strip()
+        for researcher in researchers
+        if str(researcher).strip()
+    ))
+    if len(clean_keywords) > MAX_KEYWORD_QUERIES:
+        raise ValueError(
+            f"キーワード・概念は最大{MAX_KEYWORD_QUERIES}件まで検索できます。"
+        )
+    if len(clean_researchers) > MAX_RESEARCHER_QUERIES:
+        raise ValueError(
+            f"研究者名は最大{MAX_RESEARCHER_QUERIES}人まで検索できます。"
+        )
+    queries = [
+        (keyword, False, keyword)
+        for keyword in clean_keywords
+    ] + [
+        (researcher, True, f"研究者: {researcher}")
+        for researcher in clean_researchers
+    ]
 
-    for keyword in keywords:
+    for query_index, (query, is_author, matched_term) in enumerate(queries, start=1):
+        if on_progress:
+            on_progress({
+                "status": "started",
+                "completed": query_index - 1,
+                "total": len(queries),
+                "query": query,
+                "is_author": is_author,
+            })
         try:
             results = fetch_papers(
-                keyword, max_results=30, raise_on_error=True
-            )
-            for result in results:
-                result["matched_terms"] = [keyword]
-                candidates.append(result)
-        except Exception as exc:
-            failures.append(f"キーワード「{keyword}」: {exc}")
-
-    for researcher in researchers:
-        try:
-            results = fetch_papers(
-                researcher,
-                is_author=True,
-                max_results=30,
+                query,
+                is_author=is_author,
+                max_results=PAPERS_PER_QUERY,
                 raise_on_error=True,
             )
             for result in results:
-                result["matched_terms"] = [f"研究者: {researcher}"]
+                result["matched_terms"] = [matched_term]
                 candidates.append(result)
+            if on_progress:
+                on_progress({
+                    "status": "completed",
+                    "completed": query_index,
+                    "total": len(queries),
+                    "query": query,
+                    "is_author": is_author,
+                    "result_count": len(results),
+                })
         except Exception as exc:
-            failures.append(f"研究者「{researcher}」: {exc}")
+            label = f"研究者「{query}」" if is_author else f"キーワード「{query}」"
+            failure = f"{label}: {exc}"
+            failures.append(failure)
+            if on_progress:
+                on_progress({
+                    "status": "failed",
+                    "completed": query_index,
+                    "total": len(queries),
+                    "query": query,
+                    "is_author": is_author,
+                    "error": str(exc),
+                })
 
-    if failures and not candidates:
-        raise RuntimeError("CiNii検索に失敗しました。\n" + "\n".join(failures))
     return deduplicate_candidates(candidates), failures
 
 
@@ -81,8 +122,8 @@ def normalize_extraction(payload: dict[str, Any]) -> dict[str, Any]:
         for item in raw_researchers:
             if isinstance(item, str):
                 name = item.strip()
-                role = ""
-                evidence = ""
+                role = "参考文献"
+                evidence = "参考文献に記載"
             elif isinstance(item, dict):
                 name = str(item.get("name", "")).strip()
                 role = str(item.get("role", "")).strip()
@@ -177,12 +218,10 @@ def split_text(text: str, max_chars: int = 14000, overlap: int = 500) -> list[st
 def validate_pdf_batch_size(count: int) -> None:
     if count < 1:
         raise ValueError("PDF取得対象を1件以上選択してください。")
-    if count > MAX_PDF_BATCH_SIZE:
-        raise ValueError(f"一度に処理できるPDFは最大{MAX_PDF_BATCH_SIZE}件です。")
 
 
 def is_pdf_candidate_eligible(grade: str, insufficient: bool) -> bool:
-    return not insufficient and grade in {"A", "B"}
+    return not insufficient and grade in {"A", "B", "C", "D"}
 
 
 def get_candidates_ready_for_processing(
@@ -192,7 +231,7 @@ def get_candidates_ready_for_processing(
     return conn.execute(
         """SELECT * FROM discovery_candidates
         WHERE run_id = ? AND is_selected = 1
-        AND is_insufficient = 0 AND grade IN ('A', 'B')
+        AND is_insufficient = 0 AND grade IN ('A', 'B', 'C', 'D')
         AND processing_status != '完了'
         ORDER BY id""",
         (run_id,),
@@ -207,7 +246,7 @@ def get_discovery_processing_status(
     completed_count = conn.execute(
         """SELECT COUNT(*) FROM discovery_candidates
         WHERE run_id = ? AND is_selected = 1
-        AND is_insufficient = 0 AND grade IN ('A', 'B')
+        AND is_insufficient = 0 AND grade IN ('A', 'B', 'C', 'D')
         AND processing_status = '完了'""",
         (run_id,),
     ).fetchone()[0]
@@ -247,21 +286,37 @@ def process_discovery_candidate(
     summarize_pdf: Callable[[str, str], str],
     on_warning: Callable[[str], None] | None = None,
 ) -> tuple[int | None, str | None]:
-    paper_id = None
+    candidate_id = int(candidate["id"])
+    paper_id = candidate.get("paper_id")
     try:
         with closing(connection_factory()) as conn:
-            paper_id = merge_candidate_into_papers(candidate, conn)
-            conn.execute(
-                "UPDATE discovery_candidates SET paper_id = ? WHERE id = ?",
-                (paper_id, candidate["id"]),
-            )
-            paper = conn.execute(
-                "SELECT local_pdf_path, ai_insight FROM papers WHERE id = ?",
-                (paper_id,),
+            candidate_row = conn.execute(
+                """SELECT local_pdf_path, ai_insight, paper_id
+                FROM discovery_candidates WHERE id = ?""",
+                (candidate_id,),
             ).fetchone()
+            if not candidate_row:
+                raise ValueError(f"関連文献候補が見つかりません: {candidate_id}")
+            paper_id = candidate_row["paper_id"]
+            conn.execute(
+                """UPDATE discovery_candidates
+                SET processing_status = 'PDF取得中', processing_error = ''
+                WHERE id = ?""",
+                (candidate_id,),
+            )
+            paper = None
+            if paper_id is not None:
+                paper = conn.execute(
+                    "SELECT local_pdf_path, ai_insight FROM papers WHERE id = ?",
+                    (paper_id,),
+                ).fetchone()
             conn.commit()
 
-        pdf_path = paper["local_pdf_path"] or ""
+        pdf_path = candidate_row["local_pdf_path"] or ""
+        summary = candidate_row["ai_insight"] or ""
+        if paper:
+            pdf_path = pdf_path or paper["local_pdf_path"] or ""
+            summary = summary or paper["ai_insight"] or ""
         if not pdf_path or not os.path.isfile(pdf_path):
             doi = normalize_doi(str(candidate.get("doi") or ""))
             paper_url = str(candidate.get("url") or "").strip()
@@ -280,45 +335,92 @@ def process_discovery_candidate(
             if not pdf_url:
                 raise RuntimeError("公開PDFの直リンクが見つかりませんでした。")
             pdf_path = safe_paper_pdf_path(
-                pdf_directory, paper_id, candidate["title"]
+                pdf_directory, candidate_id, candidate["title"]
             )
             download_pdf(pdf_url, pdf_path, raise_on_error=True)
             with closing(connection_factory()) as conn:
                 conn.execute(
-                    "UPDATE papers SET local_pdf_path = ? WHERE id = ?",
-                    (pdf_path, paper_id),
+                    """UPDATE discovery_candidates SET local_pdf_path = ?,
+                    processing_status = '要約中' WHERE id = ?""",
+                    (pdf_path, candidate_id),
+                )
+                conn.commit()
+        else:
+            with closing(connection_factory()) as conn:
+                conn.execute(
+                    """UPDATE discovery_candidates
+                    SET processing_status = '要約中' WHERE id = ?""",
+                    (candidate_id,),
                 )
                 conn.commit()
 
-        if not paper["ai_insight"]:
+        if not summary:
             summary = summarize_pdf(candidate["title"], pdf_path)
-            with closing(connection_factory()) as conn:
-                conn.execute(
-                    "UPDATE papers SET ai_insight = ? WHERE id = ?",
-                    (summary, paper_id),
-                )
-                conn.commit()
 
         with closing(connection_factory()) as conn:
             conn.execute("""
                 UPDATE discovery_candidates
-                SET processing_status = '完了', processing_error = ''
+                SET local_pdf_path = ?, ai_insight = ?,
+                    processing_status = '完了', processing_error = ''
                 WHERE id = ?
-            """, (candidate["id"],))
+            """, (pdf_path, summary, candidate_id))
             conn.commit()
         return paper_id, None
     except Exception as exc:
         error_message = str(exc)
+        status = (
+            "PDF未入手"
+            if "公開PDFの直リンクが見つかりませんでした" in error_message
+            else "失敗"
+        )
         with closing(connection_factory()) as conn:
             conn.execute("""
                 UPDATE discovery_candidates
                 SET paper_id = COALESCE(?, paper_id),
-                    processing_status = '失敗',
+                    processing_status = ?,
                     processing_error = ?
                 WHERE id = ?
-            """, (paper_id, error_message, candidate["id"]))
+            """, (paper_id, status, error_message, candidate_id))
             conn.commit()
         return paper_id, error_message
+
+
+def add_discovery_candidate_to_library(
+    conn: sqlite3.Connection,
+    candidate_id: int,
+) -> int:
+    candidate_row = conn.execute(
+        "SELECT * FROM discovery_candidates WHERE id = ?",
+        (candidate_id,),
+    ).fetchone()
+    if not candidate_row:
+        raise ValueError(f"関連文献候補が見つかりません: {candidate_id}")
+
+    candidate = dict(candidate_row)
+    candidate["matched_terms"] = json.loads(
+        candidate.get("matched_terms_json") or "[]"
+    )
+    paper_id = merge_candidate_into_papers(candidate, conn)
+    conn.execute(
+        """UPDATE papers
+        SET local_pdf_path = CASE
+                WHEN local_pdf_path IS NULL OR local_pdf_path = ''
+                THEN ? ELSE local_pdf_path END,
+            ai_insight = CASE
+                WHEN ai_insight IS NULL OR ai_insight = ''
+                THEN ? ELSE ai_insight END
+        WHERE id = ?""",
+        (
+            candidate.get("local_pdf_path") or "",
+            candidate.get("ai_insight") or "",
+            paper_id,
+        ),
+    )
+    conn.execute(
+        "UPDATE discovery_candidates SET paper_id = ? WHERE id = ?",
+        (paper_id, candidate_id),
+    )
+    return paper_id
 
 
 def normalize_title(title: str) -> str:
@@ -372,9 +474,13 @@ def initialize_discovery_schema(conn: sqlite3.Connection) -> None:
             is_selected INTEGER DEFAULT 0,
             processing_status TEXT DEFAULT '候補',
             processing_error TEXT DEFAULT '',
+            local_pdf_path TEXT DEFAULT '',
+            ai_insight TEXT DEFAULT '',
             UNIQUE(run_id, title)
         )
     """)
+    _ensure_discovery_column(conn, "discovery_candidates", "local_pdf_path", "TEXT DEFAULT ''")
+    _ensure_discovery_column(conn, "discovery_candidates", "ai_insight", "TEXT DEFAULT ''")
     conn.execute("""
         CREATE INDEX IF NOT EXISTS idx_discovery_candidates_run
         ON discovery_candidates (run_id, is_selected, grade)
@@ -383,6 +489,19 @@ def initialize_discovery_schema(conn: sqlite3.Connection) -> None:
         CREATE INDEX IF NOT EXISTS idx_papers_doi_nocase
         ON papers (doi COLLATE NOCASE)
     """)
+
+
+def _ensure_discovery_column(
+    conn: sqlite3.Connection,
+    table: str,
+    column: str,
+    definition: str,
+) -> None:
+    existing_columns = {
+        row[1] for row in conn.execute(f"PRAGMA table_info({table})")
+    }
+    if column not in existing_columns:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
 
 
 def save_research_baseline(
@@ -425,7 +544,7 @@ def get_discovery_runs(
     baseline_updated_at: str,
 ) -> list[sqlite3.Row]:
     return conn.execute(
-        """SELECT id, created_at FROM discovery_runs
+        """SELECT id, created_at, criteria_json FROM discovery_runs
         WHERE baseline_updated_at = ?
         ORDER BY id DESC""",
         (baseline_updated_at,),
@@ -774,6 +893,7 @@ def evaluate_candidate_batches(
     candidates: list[dict[str, Any]],
     evaluator,
     batch_size: int = 15,
+    on_progress: Callable[[int, int], None] | None = None,
 ) -> tuple[dict[str, dict[str, Any]], dict[str, str]]:
     if batch_size < 1:
         raise ValueError("評価バッチサイズは1以上にしてください。")
@@ -790,7 +910,83 @@ def evaluate_candidate_batches(
         except Exception as exc:
             for local_index in range(len(batch)):
                 failures[str(offset + local_index)] = str(exc)
+        if on_progress:
+            on_progress(min(offset + len(batch), len(candidates)), len(candidates))
     return evaluations, failures
+
+
+def build_researcher_discovery_prompt(
+    title: str,
+    research_question: str,
+    keywords: list[str],
+    concepts: list[str],
+) -> str:
+    return f"""次の研究テーマに関連する研究者候補を、Google検索で確認できる公開情報から提案してください。
+候補はテーマとの関連を説明できる研究者に限り、著名さを断定しないでください。
+各候補について、研究領域・候補とした理由・実際に検索結果の根拠として確認できたURLを最大3件示してください。
+検索結果から確認できる根拠がない候補は含めないでください。名前やURLを推測で作らないでください。
+出力は次のJSON形式のみとしてください。
+
+基準論文タイトル: {title}
+研究課題: {research_question}
+キーワード: {json.dumps(keywords, ensure_ascii=False)}
+概念: {json.dumps(concepts, ensure_ascii=False)}
+
+{{
+  "researchers": [
+    {{
+      "name": "研究者名",
+      "field": "研究分野",
+      "reason": "この研究テーマとの関連を示す具体的な理由",
+      "source_urls": ["検索で実際に確認したURL"]
+    }}
+  ]
+}}
+"""
+
+
+def parse_researcher_candidates(
+    raw_text: str,
+    grounded_sources: list[dict[str, str]],
+) -> list[dict[str, str]]:
+    source_by_url = {
+        str(source.get("url") or "").strip(): source
+        for source in grounded_sources
+        if str(source.get("url") or "").strip().startswith(("https://", "http://"))
+    }
+    if not source_by_url:
+        raise ValueError("検索結果の確認可能な出典URLがありません。")
+    payload = parse_json_response(raw_text)
+    raw_researchers = payload.get("researchers")
+    if not isinstance(raw_researchers, list):
+        raise ValueError("研究者候補がJSON形式で返されませんでした。")
+
+    researchers = []
+    seen_names = set()
+    for item in raw_researchers:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name") or "").strip()
+        reason = str(item.get("reason") or "").strip()
+        raw_urls = item.get("source_urls", [])
+        if not name or not reason or not isinstance(raw_urls, list):
+            continue
+        source_urls = list(dict.fromkeys(
+            str(url).strip()
+            for url in raw_urls
+            if str(url).strip() in source_by_url
+        ))
+        name_key = name.casefold()
+        if not source_urls or name_key in seen_names:
+            continue
+        seen_names.add(name_key)
+        researchers.append({
+            "name": name,
+            "field": str(item.get("field") or "").strip(),
+            "reason": reason,
+            "source_urls": json.dumps(source_urls, ensure_ascii=False),
+        })
+    return researchers
 
 
 def build_extraction_prompt(title: str, text: str) -> str:
@@ -806,9 +1002,12 @@ def build_extraction_prompt(title: str, text: str) -> str:
   "research_question": "研究課題を簡潔に",
   "keywords": ["検索に使える具体的な重要キーワードを最大10件"],
   "concepts": ["中心となる理論・概念を最大10件"],
-  "researchers": ["参考文献に記載された著者の氏名"]
+  "researchers": [
+    {{"name": "参考文献に記載された著者の氏名", "role": "参考文献", "evidence": "確認できた記載箇所"}}
+  ]
 }}
-本文中の言及だけに基づく研究者名は抽出しないでください。
+参考文献に記載されていることを確認できた研究者だけを抽出してください。
+本文中で言及されたのみの研究者は含めないでください。
 """
 
 

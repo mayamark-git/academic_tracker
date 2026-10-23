@@ -9,8 +9,10 @@ import requests
 from cron_fetcher import fetch_papers_from_cinii_api
 from cron_fetcher import download_pdf_file, fetch_pdf_url_from_unpaywall
 from research_discovery import (
+    add_discovery_candidate_to_library,
     analyze_research_baseline,
     build_baseline_context,
+    build_researcher_discovery_prompt,
     create_discovery_run,
     deduplicate_candidates,
     evaluate_candidate_batches,
@@ -27,6 +29,7 @@ from research_discovery import (
     normalize_extraction,
     normalize_doi,
     parse_relevance_response,
+    parse_researcher_candidates,
     save_candidate_evaluations,
     save_research_baseline,
     search_discovery_candidates,
@@ -389,14 +392,42 @@ class ResearchDiscoveryTests(unittest.TestCase):
         self.assertEqual(len(calls), 3)
         self.assertTrue(all(call[1]["raise_on_error"] for call in calls))
 
-    def test_candidate_search_raises_when_all_terms_fail(self):
+    def test_candidate_search_reports_all_failures_and_progress(self):
         def fetch_papers(query, **kwargs):
             raise RuntimeError(f"{query} unavailable")
 
-        with self.assertRaisesRegex(RuntimeError, "CiNii検索に失敗"):
+        progress = []
+        candidates, failures = search_discovery_candidates(
+            ["keyword"], ["Researcher"], fetch_papers, progress.append
+        )
+        self.assertEqual(candidates, [])
+        self.assertEqual(len(failures), 2)
+        self.assertEqual(
+            [event["status"] for event in progress],
+            ["started", "failed", "started", "failed"],
+        )
+
+    def test_candidate_search_enforces_query_limits_and_ignores_blank_terms(self):
+        with self.assertRaisesRegex(ValueError, "最大5件"):
             search_discovery_candidates(
-                ["keyword"], ["Researcher"], fetch_papers
+                [f"keyword {index}" for index in range(6)],
+                [],
+                lambda query, **kwargs: [],
             )
+        with self.assertRaisesRegex(ValueError, "最大5人"):
+            search_discovery_candidates(
+                [],
+                [f"researcher {index}" for index in range(6)],
+                lambda query, **kwargs: [],
+            )
+
+        calls = []
+        search_discovery_candidates(
+            ["  keyword  ", ""],
+            [],
+            lambda query, **kwargs: calls.append(query) or [],
+        )
+        self.assertEqual(calls, ["keyword"])
 
     def test_evaluation_results_and_failures_are_saved_to_run_candidates(self):
         connection = sqlite3.connect(":memory:")
@@ -628,14 +659,55 @@ class ResearchDiscoveryTests(unittest.TestCase):
             "researchers": [
                 {"name": "Jane Doe", "role": "参考文献", "evidence": "p. 10"},
                 {"name": "John Smith", "role": "本文中の言及"},
-                "Old legacy string",
+                "Legacy reference name",
             ],
         })
 
         self.assertEqual(result["keywords"], ["agency", "42"])
         self.assertEqual(result["researchers"][0]["role"], "参考文献")
         self.assertEqual(result["researchers"][0]["evidence"], "p. 10")
-        self.assertEqual([r["name"] for r in result["researchers"]], ["Jane Doe"])
+        self.assertEqual(
+            [r["name"] for r in result["researchers"]],
+            ["Jane Doe", "Legacy reference name"],
+        )
+
+    def test_researcher_candidate_parser_requires_grounded_source_urls(self):
+        raw_response = json.dumps({
+            "researchers": [
+                {
+                    "name": "Researcher A",
+                    "field": "Community studies",
+                    "reason": "Published research directly related to the topic.",
+                    "source_urls": ["https://university.example/researcher-a"],
+                },
+                {
+                    "name": "Unverified Researcher",
+                    "reason": "No grounded source.",
+                    "source_urls": ["https://unverified.example/profile"],
+                },
+            ]
+        })
+        sources = [{
+            "title": "Official profile",
+            "url": "https://university.example/researcher-a",
+        }]
+        candidates = parse_researcher_candidates(raw_response, sources)
+        self.assertEqual([row["name"] for row in candidates], ["Researcher A"])
+        self.assertEqual(
+            json.loads(candidates[0]["source_urls"]),
+            ["https://university.example/researcher-a"],
+        )
+        self.assertIn(
+            '"source_urls": ["検索で実際に確認したURL"]',
+            build_researcher_discovery_prompt("Title", "Question", [], []),
+        )
+
+    def test_researcher_candidate_parser_requires_grounded_sources(self):
+        with self.assertRaisesRegex(ValueError, "確認可能な出典URL"):
+            parse_researcher_candidates(
+                '{"researchers": []}',
+                [],
+            )
 
     def test_relevance_missing_result_is_marked_insufficient(self):
         candidates = [{"title": "A"}, {"title": "B"}]
@@ -737,15 +809,17 @@ class ResearchDiscoveryTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             split_text("text", max_chars=100, overlap=100)
 
-    def test_pdf_batch_limit_is_enforced(self):
-        validate_pdf_batch_size(10)
+    def test_pdf_batch_validation_has_no_fixed_maximum(self):
+        validate_pdf_batch_size(1)
+        validate_pdf_batch_size(1000)
         with self.assertRaises(ValueError):
-            validate_pdf_batch_size(11)
+            validate_pdf_batch_size(0)
 
-    def test_only_high_confidence_candidates_are_pdf_eligible(self):
+    def test_any_sufficiently_evaluated_grade_is_pdf_eligible(self):
         self.assertTrue(is_pdf_candidate_eligible("A", False))
         self.assertTrue(is_pdf_candidate_eligible("B", False))
-        self.assertFalse(is_pdf_candidate_eligible("C", False))
+        self.assertTrue(is_pdf_candidate_eligible("C", False))
+        self.assertTrue(is_pdf_candidate_eligible("D", False))
         self.assertFalse(is_pdf_candidate_eligible("A", True))
 
     def test_processing_retry_returns_only_selected_incomplete_candidates(self):
@@ -778,7 +852,10 @@ class ResearchDiscoveryTests(unittest.TestCase):
 
         ready = get_candidates_ready_for_processing(connection, 1)
 
-        self.assertEqual([row["title"] for row in ready], ["Pending", "Failed retry"])
+        self.assertEqual(
+            [row["title"] for row in ready],
+            ["Pending", "Failed retry", "Low relevance"],
+        )
 
     def test_candidate_batch_failure_does_not_discard_other_batches(self):
         candidates = [
@@ -812,6 +889,36 @@ class ResearchDiscoveryTests(unittest.TestCase):
         self.assertEqual(set(failures), {"0", "1"})
         self.assertEqual(evaluations["2"]["grade"], "B")
 
+    def test_candidate_batch_evaluation_reports_progress_for_all_items(self):
+        candidates = [{"title": f"Paper {index}"} for index in range(5)]
+        progress = []
+
+        def evaluator(prompt):
+            payload = json.loads(
+                prompt.split("候補:\n", 1)[1].split("\n\n出力形式:", 1)[0]
+            )
+            return json.dumps({
+                "candidates": [{
+                    "candidate_id": item["candidate_id"],
+                    "grade": "B",
+                    "content_reason": "Related",
+                    "researcher_reason": "No match",
+                    "insufficient": False,
+                } for item in payload]
+            })
+
+        evaluations, failures = evaluate_candidate_batches(
+            {"title": "Baseline"},
+            candidates,
+            evaluator,
+            batch_size=2,
+            on_progress=lambda completed, total: progress.append((completed, total)),
+        )
+
+        self.assertEqual(len(evaluations), 5)
+        self.assertEqual(failures, {})
+        self.assertEqual(progress, [(2, 5), (4, 5), (5, 5)])
+
     def test_discovery_schema_initializes_repeatedly(self):
         connection = sqlite3.connect(":memory:")
         self.addCleanup(connection.close)
@@ -825,6 +932,63 @@ class ResearchDiscoveryTests(unittest.TestCase):
             )
         }
         self.assertTrue({"research_baseline", "discovery_runs", "discovery_candidates"} <= tables)
+        candidate_columns = {
+            row[1] for row in connection.execute(
+                "PRAGMA table_info(discovery_candidates)"
+            )
+        }
+        self.assertTrue({"local_pdf_path", "ai_insight"} <= candidate_columns)
+
+    def test_discovery_schema_upgrades_existing_candidate_table(self):
+        connection = sqlite3.connect(":memory:")
+        self.addCleanup(connection.close)
+        connection.execute("CREATE TABLE papers (id INTEGER PRIMARY KEY, doi TEXT)")
+        connection.execute("""
+            CREATE TABLE discovery_candidates (
+                id INTEGER PRIMARY KEY,
+                run_id INTEGER NOT NULL,
+                paper_id INTEGER,
+                title TEXT NOT NULL,
+                author TEXT DEFAULT '',
+                first_author TEXT DEFAULT '',
+                journal TEXT DEFAULT '',
+                pub_date TEXT DEFAULT '',
+                url TEXT DEFAULT '',
+                doi TEXT DEFAULT '',
+                abstract TEXT DEFAULT '',
+                matched_terms_json TEXT NOT NULL DEFAULT '[]',
+                grade TEXT DEFAULT '',
+                content_reason TEXT DEFAULT '',
+                researcher_reason TEXT DEFAULT '',
+                insufficient_reason TEXT DEFAULT '',
+                is_insufficient INTEGER DEFAULT 0,
+                is_selected INTEGER DEFAULT 0,
+                processing_status TEXT DEFAULT '候補',
+                processing_error TEXT DEFAULT '',
+                UNIQUE(run_id, title)
+            )
+        """)
+        connection.execute(
+            """INSERT INTO discovery_candidates (run_id, title, grade)
+            VALUES (?, ?, ?)""",
+            (7, "Existing candidate", "B"),
+        )
+
+        initialize_discovery_schema(connection)
+        initialize_discovery_schema(connection)
+        columns = {
+            row[1] for row in connection.execute(
+                "PRAGMA table_info(discovery_candidates)"
+            )
+        }
+        self.assertTrue({"local_pdf_path", "ai_insight"} <= columns)
+        migrated_row = connection.execute(
+            """SELECT title, grade, local_pdf_path, ai_insight
+            FROM discovery_candidates WHERE run_id = ?""",
+            (7,),
+        ).fetchone()
+        self.assertEqual(migrated_row[:2], ("Existing candidate", "B"))
+        self.assertEqual(migrated_row[2:], ("", ""))
 
     def test_merge_matches_doi_and_preserves_existing_user_fields(self):
         connection = sqlite3.connect(":memory:")

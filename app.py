@@ -1,5 +1,4 @@
 ﻿import os
-import sqlite3
 import math
 import time
 import warnings
@@ -7,9 +6,7 @@ import urllib.parse
 import re
 import json
 import hashlib
-import requests
 
-from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 from database import (
     create_database_backup,
@@ -21,7 +18,6 @@ from database import (
 from cron_fetcher import (
     fetch_new_papers_from_cinii,
     fetch_single_detailed_abstract,
-    clean_url,
     extract_doi_from_cinii_url,
     fetch_papers_from_cinii_api,
     fetch_pdf_url_from_unpaywall,
@@ -29,9 +25,10 @@ from cron_fetcher import (
     download_pdf_file
 )
 from research_discovery import (
-    MAX_PDF_BATCH_SIZE,
+    add_discovery_candidate_to_library,
     analyze_research_baseline,
     build_baseline_context,
+    build_researcher_discovery_prompt,
     create_discovery_run,
     evaluate_candidate_batches,
     filter_discovery_candidates,
@@ -41,18 +38,16 @@ from research_discovery import (
     get_discovery_runs,
     get_discovery_processing_status,
     is_pdf_candidate_eligible,
-    merge_candidate_into_papers,
     normalize_extraction,
     normalize_title,
+    parse_researcher_candidates,
     process_discovery_candidate,
     save_candidate_evaluations,
     save_research_baseline,
-    safe_paper_pdf_path,
     search_discovery_candidates,
     set_discovery_candidate_selected,
     split_text,
     update_research_baseline_analysis,
-    validate_pdf_batch_size,
 )
 from researcher_profiles import (
     fetch_researcher_profile_with_ai as fetch_researcher_profile,
@@ -66,6 +61,7 @@ from research_watch import (
     get_due_research_topics,
     get_research_topics,
     get_research_watch_history,
+    extract_grounded_sources,
 )
 
 import streamlit as st
@@ -78,11 +74,9 @@ except ImportError:
 try:
     from google import genai
     from google.genai import types
-    from google.genai.errors import APIError
 except ImportError:
     genai = None
     types = None
-    APIError = Exception
 
 warnings.filterwarnings("ignore", category=DeprecationWarning)
 
@@ -286,6 +280,15 @@ def _is_quota_error(exc: Exception) -> bool:
     return "429" in text or "RESOURCE_EXHAUSTED" in text or "TOO_MANY_REQUESTS" in text
 
 
+def _gemini_quota_error_message() -> str:
+    return (
+        "Gemini APIの利用枠に達したため、研究者候補を検索できませんでした。"
+        "アプリからは利用枠を解除できません。APIキーが属するGoogle AI Studioの"
+        "プロジェクトについて、利用状況・レート制限・請求設定を確認してください。"
+        "一時的な上限の場合は、表示されているリセット時刻以降に再試行してください。"
+    )
+
+
 def _is_transient_error(exc: Exception) -> bool:
     text = str(exc).upper()
     return any(token in text for token in (
@@ -326,9 +329,7 @@ def call_gemini_with_retry(prompt: str, preferred_model: str = "gemini-3.6-flash
             break
 
     if _is_quota_error(last_err or Exception()):
-        raise RuntimeError(
-            "Gemini APIのリクエスト制限（429 / RESOURCE_EXHAUSTED）に達しています。16:00のリセット以降にお試しください。"
-        ) from last_err
+        raise RuntimeError(_gemini_quota_error_message()) from last_err
     raise RuntimeError(f"Gemini APIエラー: {last_err}") from last_err
 
 
@@ -612,13 +613,42 @@ def initialize_app_database():
     init_db(clear_papers_only=False)
 
 
-def evaluate_discovery_candidates(baseline, candidates):
+def evaluate_discovery_candidates(baseline, candidates, on_progress=None):
     return evaluate_candidate_batches(
         baseline,
         candidates,
         call_gemini_with_retry,
         batch_size=10,
+        on_progress=on_progress,
     )
+
+
+def discover_related_researchers(
+    title: str,
+    analysis: dict,
+) -> list[dict[str, str]]:
+    if not genai or not types:
+        raise RuntimeError("研究者候補のWeb検索に必要なGoogle GenAI SDKが利用できません。")
+    client = _gemini_client()
+    prompt = build_researcher_discovery_prompt(
+        title,
+        analysis.get("research_question", ""),
+        analysis.get("keywords", []),
+        analysis.get("concepts", []),
+    )
+    response = client.models.generate_content(
+        model="gemini-3.6-flash",
+        contents=prompt,
+        config=types.GenerateContentConfig(
+            tools=[types.Tool(google_search=types.GoogleSearch())],
+            temperature=0.1,
+        ),
+    )
+    response_text = str(getattr(response, "text", "") or "").strip()
+    if not response_text:
+        raise RuntimeError("研究者候補の回答を取得できませんでした。")
+    grounded_sources = extract_grounded_sources(response)
+    return parse_researcher_candidates(response_text, grounded_sources)
 
 
 # ============================================================
@@ -1366,9 +1396,123 @@ elif page == "🧭 自分の論文から探す":
             st.success("抽出内容を保存しました。")
             st.rerun()
 
+        researcher_discovery_key = (
+            f"theme_researchers_{baseline_row['updated_at']}"
+        )
+        st.markdown("#### 研究テーマに関連する研究者候補")
+        if st.button(
+            "Web検索で研究者候補を探す",
+            key=f"discover_researchers_{baseline_row['updated_at']}",
+        ):
+            try:
+                with st.spinner("研究テーマに関連する研究者と根拠を検索中..."):
+                    st.session_state[researcher_discovery_key] = (
+                        discover_related_researchers(
+                            baseline_row["title"], analysis
+                        )
+                    )
+                st.success(
+                    f"{len(st.session_state[researcher_discovery_key])}人の候補を確認しました。"
+                )
+            except Exception as exc:
+                if _is_quota_error(exc):
+                    st.error(_gemini_quota_error_message())
+                    st.markdown(
+                        "[Gemini APIの利用状況](https://ai.dev/rate-limit) · "
+                        "[Gemini APIのレート制限](https://ai.google.dev/gemini-api/docs/rate-limits)"
+                    )
+                else:
+                    st.error(f"研究者候補を検索できませんでした: {exc}")
+
+        suggested_researchers = st.session_state.get(
+            researcher_discovery_key, []
+        )
+        selected_researcher_suggestions = []
+        if suggested_researchers:
+            for index, suggestion in enumerate(suggested_researchers):
+                with st.expander(
+                    f"{suggestion['name']} — {suggestion.get('field') or '分野情報なし'}",
+                    expanded=False,
+                ):
+                    st.write(suggestion["reason"])
+                    for source_url in json.loads(
+                        suggestion.get("source_urls") or "[]"
+                    ):
+                        st.link_button(
+                            "根拠ページを開く",
+                            source_url,
+                            key=f"researcher_source_{baseline_row['updated_at']}_{index}_{hashlib.sha1(source_url.encode('utf-8')).hexdigest()[:8]}",
+                        )
+                    if st.checkbox(
+                        "研究者として登録する",
+                        key=f"select_researcher_suggestion_{baseline_row['updated_at']}_{index}",
+                    ):
+                        selected_researcher_suggestions.append(suggestion)
+
+            if st.button(
+                f"選択した{len(selected_researcher_suggestions)}人を研究者管理に登録",
+                disabled=not selected_researcher_suggestions,
+                key=f"register_researchers_{baseline_row['updated_at']}",
+            ):
+                added_names = []
+                existing_names = []
+                with get_connection() as conn:
+                    for suggestion in selected_researcher_suggestions:
+                        clean_name = sanitize_name(suggestion["name"])
+                        if not clean_name:
+                            continue
+                        cursor = conn.execute(
+                            """INSERT OR IGNORE INTO target_authors
+                            (name, sort_order, column_idx) VALUES (
+                                ?, COALESCE(
+                                    (SELECT MAX(sort_order) + 1 FROM target_authors),
+                                    1
+                                ), 0
+                            )""",
+                            (clean_name,),
+                        )
+                        conn.execute(
+                            """INSERT OR IGNORE INTO researcher_profiles
+                            (name, field, school_of_thought, key_concepts,
+                             academic_societies, memo)
+                            VALUES (?, ?, '', '', '', ?)""",
+                            (
+                                clean_name,
+                                suggestion.get("field", ""),
+                                suggestion["reason"],
+                            ),
+                        )
+                        if cursor.rowcount:
+                            added_names.append(clean_name)
+                        else:
+                            existing_names.append(clean_name)
+                if added_names:
+                    st.success("研究者管理に登録しました: " + "、".join(added_names))
+                if existing_names:
+                    st.info("登録済みのため重複追加しませんでした: " + "、".join(existing_names))
+
         available_keywords = list(dict.fromkeys(analysis["keywords"] + analysis["concepts"]))
+        with get_connection() as conn:
+            registered_researchers = [
+                row["name"]
+                for row in conn.execute(
+                    "SELECT name FROM target_authors ORDER BY name COLLATE NOCASE"
+                ).fetchall()
+            ]
+            registered_keywords = [
+                row["keyword"]
+                for row in conn.execute(
+                    "SELECT keyword FROM target_keywords ORDER BY keyword COLLATE NOCASE"
+                ).fetchall()
+            ]
+        available_keywords = list(dict.fromkeys(
+            available_keywords + registered_keywords
+        ))
         available_researchers = list(dict.fromkeys(
-            researcher["name"] for researcher in analysis["researchers"]
+            [
+                researcher["name"]
+                for researcher in analysis["researchers"]
+            ] + registered_researchers
         ))
         st.markdown("#### CiNiiから関連候補を収集")
         if not available_keywords and not available_researchers:
@@ -1386,65 +1530,118 @@ elif page == "🧭 自分の論文から探す":
                 default=available_researchers[:5],
                 key=f"discovery_researchers_{baseline_row['updated_at']}",
             )
-            st.caption("各検索条件から最大30件を取得します。PDFはこの段階ではダウンロードしません。")
+            st.caption(
+                "キーワード・概念は最大5件、研究者名は最大5人です。"
+                "各検索条件から最大30件を取得します。"
+                "検索で取得した候補はすべて履歴に表示し、PDFはこの段階では取得しません。"
+            )
             if len(selected_keywords) > 5 or len(selected_researchers) > 5:
                 st.error("検索負荷を抑えるため、キーワード・研究者はそれぞれ最大5件にしてください。")
-            elif st.button(
+            else:
+                st.caption(
+                    f"今回実行する検索クエリ: "
+                    f"{len(selected_keywords) + len(selected_researchers)}件"
+                )
+            if len(selected_keywords) <= 5 and len(selected_researchers) <= 5 and st.button(
                 "CiNiiで候補を検索・関連度判定",
                 type="primary",
                 disabled=not (selected_keywords or selected_researchers),
+                key=f"search_discovery_{baseline_row['updated_at']}",
             ):
                 try:
+                    search_status = st.status(
+                        "CiNii検索を開始します...", expanded=True
+                    )
+                    search_progress = st.progress(0.0)
+
+                    def update_search_progress(event):
+                        query_total = event["total"]
+                        if event["status"] == "started":
+                            search_status.write(
+                                f"検索中 {event['completed'] + 1}/{query_total}件: "
+                                f"{event['query']}"
+                            )
+                        elif event["status"] == "completed":
+                            search_status.write(
+                                f"完了 {event['completed']}/{query_total}件: "
+                                f"{event['query']} — {event['result_count']}件"
+                            )
+                            search_progress.progress(
+                                event["completed"] / max(query_total, 1)
+                            )
+                        else:
+                            search_status.write(
+                                f"失敗 {event['completed']}/{query_total}件: "
+                                f"{event['query']} — {event['error']}"
+                            )
+                            search_progress.progress(
+                                event["completed"] / max(query_total, 1)
+                            )
+
                     with st.spinner("CiNiiから候補を収集しています..."):
                         candidates, search_failures = search_discovery_candidates(
                             selected_keywords,
                             selected_researchers,
                             fetch_papers_from_cinii_api,
+                            on_progress=update_search_progress,
                         )
-                    total_candidate_count = len(candidates)
                     own_title = normalize_title(baseline_row["title"])
                     candidates = [
                         candidate for candidate in candidates
                         if normalize_title(candidate.get("title", "")) != own_title
                     ]
-                    candidates.sort(
-                        key=lambda candidate: (
-                            len(candidate.get("matched_terms", [])),
-                            bool(candidate.get("abstract")),
-                        ),
-                        reverse=True,
+                    with get_connection() as conn:
+                        ignored_titles = {
+                            normalize_title(row["title"])
+                            for row in conn.execute(
+                                "SELECT title FROM ignored_papers"
+                            ).fetchall()
+                        }
+                        candidates = [
+                            candidate for candidate in candidates
+                            if normalize_title(candidate["title"]) not in ignored_titles
+                        ]
+                        run_id = create_discovery_run(
+                            conn,
+                            baseline_row["updated_at"],
+                            {
+                                "keywords": selected_keywords,
+                                "researchers": selected_researchers,
+                                "query_count": (
+                                    len(selected_keywords) + len(selected_researchers)
+                                ),
+                                "search_failures": search_failures,
+                            },
+                            candidates,
+                        )
+                    search_status.update(
+                        label=f"CiNii検索完了: 候補 {len(candidates)}件",
+                        state="complete",
                     )
-                    candidates = candidates[:100]
                     if not candidates:
-                        st.warning("CiNiiから候補文献が見つかりませんでした。")
+                        st.warning("今回の検索では候補文献が見つかりませんでした。検索履歴には保存しました。")
                     else:
                         baseline_context = build_baseline_context(
                             baseline_row["title"], analysis
                         )
-                        with get_connection() as conn:
-                            ignored_titles = {
-                                normalize_title(row["title"])
-                                for row in conn.execute(
-                                    "SELECT title FROM ignored_papers"
-                                ).fetchall()
-                            }
-                            candidates = [
-                                candidate for candidate in candidates
-                                if normalize_title(candidate["title"]) not in ignored_titles
-                            ]
-                            run_id = create_discovery_run(
-                                conn,
-                                baseline_row["updated_at"],
-                                {
-                                    "keywords": selected_keywords,
-                                    "researchers": selected_researchers,
-                                },
+                        evaluation_progress = st.progress(0.0)
+                        evaluation_status = st.empty()
+
+                        def update_evaluation_progress(completed, total):
+                            evaluation_status.text(
+                                f"関連度判定中 {completed}/{total}件"
+                            )
+                            evaluation_progress.progress(
+                                completed / max(total, 1)
+                            )
+
+                        evaluations, evaluation_failures = (
+                            evaluate_discovery_candidates(
+                                baseline_context,
                                 candidates,
+                                on_progress=update_evaluation_progress,
                             )
-                        with st.spinner(f"{len(candidates)}件の候補を関連度判定中..."):
-                            evaluations, evaluation_failures = evaluate_discovery_candidates(
-                                baseline_context, candidates
-                            )
+                        )
                         with get_connection() as conn:
                             save_candidate_evaluations(
                                 conn,
@@ -1457,16 +1654,17 @@ elif page == "🧭 自分の論文から探す":
                         failed_count = len(evaluation_failures)
                         if failed_count:
                             st.warning(
-                                f"{evaluated_count}件は関連度判定済み、{failed_count}件はGeminiの一時エラーで未判定です。"
-                                "候補は保存されているので、下の「未判定候補を再判定」から再試行できます。"
+                                f"{evaluated_count}件は判定済み、{failed_count}件は未判定です。"
+                                "保存済み候補を再判定できます。"
                             )
                         else:
-                            st.success(f"{evaluated_count}件の候補を評価しました。")
-                        if total_candidate_count > 100:
-                            st.info("候補が100件を超えたため、最初の100件を評価しました。検索条件を絞ると候補を入れ替えられます。")
-                        if search_failures:
-                            st.warning("一部の検索条件で取得エラーがありました:\n" + "\n".join(search_failures))
-                        st.rerun()
+                            st.success(f"{evaluated_count}件の候補を判定しました。")
+                    if search_failures:
+                        st.warning(
+                            "一部の検索条件で取得エラーがありました:\n"
+                            + "\n".join(search_failures)
+                        )
+                    st.rerun()
                 except Exception as exc:
                     st.error(f"候補の検索・関連度判定に失敗しました: {exc}")
 
@@ -1490,6 +1688,23 @@ elif page == "🧭 自分の論文から探す":
 
         if latest_run:
             st.markdown(f"#### 候補一覧（検索日時: {latest_run['created_at']}）")
+            try:
+                run_criteria = json.loads(latest_run["criteria_json"] or "{}")
+            except (json.JSONDecodeError, TypeError) as exc:
+                run_criteria = {}
+                st.error(f"検索条件を読み取れません: {exc}")
+            st.caption(
+                "検索語: "
+                + (", ".join(run_criteria.get("keywords", [])) or "なし")
+                + " ｜ 研究者: "
+                + (", ".join(run_criteria.get("researchers", [])) or "なし")
+                + f" ｜ クエリ数: {run_criteria.get('query_count', 0)}"
+            )
+            if run_criteria.get("search_failures"):
+                st.warning(
+                    "この検索実行で失敗した条件:\n"
+                    + "\n".join(run_criteria["search_failures"])
+                )
             with get_connection() as conn:
                 retryable_rows = [
                     dict(candidate)
@@ -1515,9 +1730,20 @@ elif page == "🧭 自分の論文から探す":
                     baseline_context = build_baseline_context(
                         baseline_row["title"], analysis
                     )
+                    retry_progress = st.progress(0.0)
+                    retry_progress_text = st.empty()
+
+                    def update_retry_progress(completed, total):
+                        retry_progress_text.text(
+                            f"関連度再判定中 {completed}/{total}件"
+                        )
+                        retry_progress.progress(completed / max(total, 1))
+
                     with st.spinner(f"{len(retry_candidates)}件を再判定中..."):
                         evaluations, evaluation_failures = evaluate_discovery_candidates(
-                            baseline_context, retry_candidates
+                            baseline_context,
+                            retry_candidates,
+                            on_progress=update_retry_progress,
                         )
                     with get_connection() as conn:
                         save_candidate_evaluations(
@@ -1538,7 +1764,7 @@ elif page == "🧭 自分の論文から探す":
             st.caption(
                 "等級は論文内容を主軸に判定し、研究者との一致は補足情報として扱います。"
                 "A:非常に強い関連 / B:明確な関連 / C:部分的な関連 / D:有意な関連なし。"
-                "PDF取得を選べるのはA・Bのみです。判定待ち・判定エラー・判定材料不足は別に表示します。"
+                "取得候補はすべて表示します。判定待ち・判定エラー・判定材料不足も確認できます。"
             )
             grade_filter = st.selectbox(
                 "関連度で絞り込み",
@@ -1549,11 +1775,20 @@ elif page == "🧭 自分の論文から探す":
                 run_candidates, grade_filter
             )
             st.caption(f"表示中: {len(filtered_candidates)} / {len(run_candidates)} 件")
+            candidates_to_add = []
             for candidate in filtered_candidates:
                 candidate = dict(candidate)
                 candidate_id = candidate["id"]
                 terms = ", ".join(json.loads(candidate["matched_terms_json"] or "[]"))
                 evaluation_label = get_candidate_evaluation_label(candidate)
+                already_in_library = candidate["paper_id"] is not None
+                if already_in_library:
+                    st.caption(f"論文一覧に登録済み（ID: {candidate['paper_id']}）")
+                elif st.checkbox(
+                    "論文一覧へ追加",
+                    key=f"discovery_add_to_library_{candidate_id}",
+                ):
+                    candidates_to_add.append(candidate)
                 selected = st.checkbox(
                     f"[{evaluation_label}] {candidate['title']} — {candidate['first_author'] or candidate['author'] or '著者不明'} ({candidate['pub_date'] or '年不明'})",
                     value=bool(candidate["is_selected"]),
@@ -1581,11 +1816,70 @@ elif page == "🧭 自分の論文から探す":
                         st.write(candidate["abstract"])
                     if candidate["url"]:
                         st.link_button("CiNiiの書誌情報を開く", candidate["url"])
+                    scholar_url = build_search_url(
+                        "https://scholar.google.com/scholar",
+                        "q",
+                        candidate["title"],
+                    )
+                    st.link_button(
+                        "Google Scholarで追加調査",
+                        scholar_url,
+                        key=f"discovery_scholar_{candidate_id}",
+                    )
+                    pdf_path = candidate.get("local_pdf_path") or ""
+                    summary = candidate.get("ai_insight") or ""
+                    if candidate.get("paper_id") is not None and (
+                        not pdf_path or not summary
+                    ):
+                        with get_connection() as conn:
+                            library_paper = conn.execute(
+                                """SELECT local_pdf_path, ai_insight
+                                FROM papers WHERE id = ?""",
+                                (candidate["paper_id"],),
+                            ).fetchone()
+                        if library_paper:
+                            pdf_path = pdf_path or library_paper["local_pdf_path"] or ""
+                            summary = summary or library_paper["ai_insight"] or ""
+                    if pdf_path and os.path.isfile(pdf_path):
+                        st.caption(f"PDF入手済み: {os.path.basename(pdf_path)}")
+                        with open(pdf_path, "rb") as pdf_file:
+                            st.download_button(
+                                "PDFを保存",
+                                data=pdf_file.read(),
+                                file_name=os.path.basename(pdf_path),
+                                mime="application/pdf",
+                                key=f"discovery_pdf_download_{candidate_id}",
+                            )
+                    elif candidate["processing_status"] in {"PDF未入手", "失敗"}:
+                        st.warning(
+                            f"PDF未入手・処理失敗: "
+                            f"{candidate['processing_error'] or candidate['processing_status']}"
+                        )
+                    else:
+                        st.caption("PDF未取得")
+                    if summary:
+                        st.markdown("**PDF本文に基づく要約**")
+                        st.write(summary)
                     if candidate["processing_status"] != "候補":
                         st.info(
                             f"処理状態: {candidate['processing_status']}"
                             + (f" — {candidate['processing_error']}" if candidate["processing_error"] else "")
                         )
+
+            if st.button(
+                f"選択した{len(candidates_to_add)}件を論文一覧へ追加",
+                disabled=not candidates_to_add,
+                key=f"add_discovery_to_library_{latest_run['id']}",
+            ):
+                added_count = 0
+                with get_connection() as conn:
+                    for candidate in candidates_to_add:
+                        add_discovery_candidate_to_library(
+                            conn, candidate["id"]
+                        )
+                        added_count += 1
+                st.success(f"{added_count}件を論文一覧へ追加しました。")
+                st.rerun()
 
             with get_connection() as conn:
                 ready_rows, completed_selected_count = (
@@ -1598,25 +1892,21 @@ elif page == "🧭 自分の論文から探す":
                     f"選択済みの完了項目 {completed_selected_count} 件は再処理対象から除外します。"
                 )
 
-            if selected_count > MAX_PDF_BATCH_SIZE:
-                st.error(
-                    f"未完了の選択項目が{selected_count}件あります。"
-                    f"1回の処理は最大{MAX_PDF_BATCH_SIZE}件です。"
-                )
-            elif st.button(
+            if st.button(
                 f"未完了の選択した{selected_count}件をPDF取得・要約",
                 type="primary",
                 disabled=selected_count == 0,
+                key=f"process_discovery_pdfs_{latest_run['id']}",
             ):
-                try:
-                    validate_pdf_batch_size(len(selected_rows))
-                except ValueError as exc:
-                    st.error(str(exc))
-                    st.stop()
                 progress = st.progress(0.0)
+                progress_text = st.empty()
                 completed = 0
                 failures = []
                 for index, candidate in enumerate(selected_rows, start=1):
+                    progress_text.text(
+                        f"PDF取得・要約中 {index}/{len(selected_rows)}件: "
+                        f"{candidate['title']}"
+                    )
                     progress.progress((index - 1) / len(selected_rows))
                     with st.spinner(f"({index}/{len(selected_rows)}) {candidate['title']} をPDF取得・要約中..."):
                         paper_id, error_message = process_discovery_candidate(
@@ -1641,6 +1931,9 @@ elif page == "🧭 自分の論文から探す":
                     )
                 else:
                     st.success(f"{completed}件のPDF取得・要約が完了しました。")
+                progress_text.text(
+                    f"PDF取得・要約完了: 成功 {completed}件、失敗 {len(failures)}件"
+                )
                 st.rerun()
 
 
