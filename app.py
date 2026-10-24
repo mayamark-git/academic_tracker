@@ -849,7 +849,7 @@ if page == "📄 論文一覧":
     if "filter_page" not in st.session_state:
         st.session_state.filter_page = 1
 
-    col1, col2, col3, col4, col5, col6 = st.columns([1.6, 1.6, 1.8, 1.0, 1.0, 1.6])
+    col1, col2, col3, col4, col5, col6, col7 = st.columns([1.5, 1.4, 1.6, 0.9, 0.9, 1.5, 1.2])
 
     with col1:
         author_query = st.text_input("著者名絞り込み", value=st.session_state.filter_author)
@@ -888,20 +888,21 @@ if page == "📄 論文一覧":
         sort_order = st.selectbox("並び替え", sort_opts, index=sort_idx)
         st.session_state.filter_sort = sort_order
 
-    source_opts = ["すべて", "関連文献探索から追加"]
-    if st.session_state.get("filter_source") not in source_opts:
-        st.session_state.filter_source = "すべて"
-    selected_source = st.selectbox(
-        "登録元",
-        source_opts,
-        index=source_opts.index(st.session_state.filter_source),
-    )
-    st.session_state.filter_source = selected_source
+    with col7:
+        source_opts = ["すべて", "探索追加"]
+        if st.session_state.get("filter_source") not in source_opts:
+            st.session_state.filter_source = "すべて"
+        selected_source = st.selectbox(
+            "登録元",
+            source_opts,
+            index=source_opts.index(st.session_state.filter_source),
+        )
+        st.session_state.filter_source = selected_source
 
     query = "SELECT * FROM papers WHERE 1=1"
     params = []
 
-    if selected_source == "関連文献探索から追加":
+    if selected_source == "探索追加":
         query += " AND id IN (SELECT paper_id FROM discovery_candidates WHERE paper_id IS NOT NULL)"
 
     if author_query:
