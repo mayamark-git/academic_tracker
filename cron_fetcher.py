@@ -329,6 +329,46 @@ def get_jstage_pdf_url(url: str) -> str:
     return ""
 
 
+def find_pdf_url_from_landing_page(page_url: str) -> str:
+    """DOIまたは論文ページを開き、ページ内にリンクされたPDFのURLを探す"""
+    target = (page_url or "").strip()
+    if not target:
+        return ""
+    if not target.startswith("http"):
+        target = "https://doi.org/" + target
+    if "cir.nii.ac.jp/crid/" in target:
+        doi_url = extract_doi_from_cinii_url(target)
+        if not doi_url:
+            return ""
+        target = doi_url
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"}
+    try:
+        res = requests.get(target, headers=headers, timeout=10, allow_redirects=True)
+        if res.status_code != 200:
+            return ""
+        if "pdf" in res.headers.get("Content-Type", "").lower():
+            return res.url
+        soup = BeautifulSoup(res.text, "html.parser")
+        meta = soup.find("meta", attrs={"name": re.compile(r"^citation_pdf_url$", re.I)})
+        if meta and meta.get("content"):
+            return urllib.parse.urljoin(res.url, meta["content"].strip())
+        fallback = ""
+        for link in soup.find_all("a", href=True):
+            href = link["href"].strip()
+            if href.startswith(("#", "javascript:", "mailto:")):
+                continue
+            path = urllib.parse.urlparse(href).path.lower()
+            text = link.get_text(" ", strip=True).lower()
+            if path.endswith(".pdf"):
+                return urllib.parse.urljoin(res.url, href)
+            if not fallback and ("pdf" in text or "pdf" in path):
+                fallback = urllib.parse.urljoin(res.url, href)
+        return fallback
+    except Exception as e:
+        print(f"Landing page PDF lookup failed [{target}]: {e}")
+        return ""
+
+
 def download_pdf_file(url: str, save_path: str, raise_on_error: bool = False) -> bool:
     """指定されたURLからPDFファイルをダウンロードして保存"""
     headers = {

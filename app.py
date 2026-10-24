@@ -22,6 +22,7 @@ from cron_fetcher import (
     fetch_papers_from_cinii_api,
     fetch_pdf_url_from_unpaywall,
     get_jstage_pdf_url,
+    find_pdf_url_from_landing_page,
     download_pdf_file
 )
 from research_discovery import (
@@ -1710,6 +1711,18 @@ elif page == "🧭 自分の論文から探す":
             )
             latest_run = runs_by_id[selected_run_id]
             run_candidates = get_discovery_candidates(conn, latest_run["id"])
+            hidden_no_pdf_count = sum(
+                1 for row in run_candidates
+                if row["processing_status"] == "PDF未入手"
+                and row["paper_id"] is None
+            )
+            run_candidates = [
+                row for row in run_candidates
+                if not (
+                    row["processing_status"] == "PDF未入手"
+                    and row["paper_id"] is None
+                )
+            ]
 
         if latest_run:
             st.markdown(f"#### 候補一覧（検索日時: {latest_run['created_at']}）")
@@ -1800,6 +1813,8 @@ elif page == "🧭 自分の論文から探す":
                 run_candidates, grade_filter
             )
             st.caption(f"表示中: {len(filtered_candidates)} / {len(run_candidates)} 件")
+            if hidden_no_pdf_count:
+                st.caption(f"PDFを取得できなかった {hidden_no_pdf_count} 件は一覧から除外しています。")
             st.info(
                 "候補ごとのチェックは共通です。チェックした候補は、一覧の上にあるボタンから"
                 "「書誌情報のみ追加」または「PDF取得・要約して追加」を選べます。"
@@ -1815,6 +1830,13 @@ elif page == "🧭 自分の論文から探す":
                 if row["is_selected"] and row["paper_id"] is None
             ]
             st.markdown("##### 選択した候補の処理")
+            last_result = st.session_state.get("discovery_last_result")
+            if last_result:
+                level, message = last_result
+                getattr(st, level)(message)
+                if st.button("結果表示を閉じる", key="dismiss_discovery_result"):
+                    st.session_state.pop("discovery_last_result", None)
+                    st.rerun()
             if st.button(
                 f"📚 チェックした{len(candidates_to_add)}件を書誌情報のみで論文一覧へ追加",
                 disabled=not candidates_to_add,
@@ -1827,7 +1849,9 @@ elif page == "🧭 自分の論文から探す":
                             conn, candidate["id"]
                         )
                         added_count += 1
-                st.success(f"{added_count}件を論文一覧へ追加しました。")
+                st.session_state["discovery_last_result"] = (
+                    "success", f"{added_count}件を論文一覧へ追加しました。"
+                )
                 st.rerun()
 
             with get_connection() as conn:
@@ -1851,6 +1875,7 @@ elif page == "🧭 自分の論文から探す":
                 progress_text = st.empty()
                 completed = 0
                 failures = []
+                warnings_seen = []
                 for index, candidate in enumerate(selected_rows, start=1):
                     progress_text.text(
                         f"PDF取得・要約中 {index}/{len(selected_rows)}件: "
@@ -1866,27 +1891,27 @@ elif page == "🧭 自分の論文から探す":
                             get_jstage_pdf_url,
                             download_pdf_file,
                             summarize_full_pdf_with_gemini,
-                            on_warning=st.warning,
+                            on_warning=warnings_seen.append,
+                            find_pdf_url_from_page=find_pdf_url_from_landing_page,
                         )
                     if error_message:
                         failures.append(f"{candidate['title']}: {error_message}")
                     else:
                         completed += 1
                     progress.progress(index / len(selected_rows))
+                extra = ("\n\n注意:\n" + "\n".join(f"- {w}" for w in warnings_seen)) if warnings_seen else ""
                 if failures:
-                    st.warning(
+                    st.session_state["discovery_last_result"] = (
+                        "warning",
                         f"{completed}件は論文一覧への追加まで完了、"
-                        f"{len(failures)}件は失敗しました。\n"
-                        + "\n".join(failures)
+                        f"{len(failures)}件は失敗しました。\n\n"
+                        + "\n".join(f"- {f}" for f in failures) + extra,
                     )
                 else:
-                    st.success(
-                        f"{completed}件のPDF取得・要約と論文一覧への追加が完了しました。"
+                    st.session_state["discovery_last_result"] = (
+                        "success",
+                        f"{completed}件のPDF取得・要約と論文一覧への追加が完了しました。" + extra,
                     )
-                progress_text.text(
-                    f"PDF取得・要約・論文一覧への追加: "
-                    f"成功 {completed}件、失敗 {len(failures)}件"
-                )
                 st.rerun()
 
             page_size = 20

@@ -232,6 +232,7 @@ def get_candidates_ready_for_processing(
         """SELECT * FROM discovery_candidates
         WHERE run_id = ? AND is_selected = 1
         AND is_insufficient = 0 AND grade IN ('A', 'B', 'C', 'D')
+        AND processing_status != 'PDF未入手'
         AND (processing_status != '完了' OR paper_id IS NULL)
         ORDER BY id""",
         (run_id,),
@@ -285,6 +286,7 @@ def process_discovery_candidate(
     download_pdf: Callable[..., bool],
     summarize_pdf: Callable[[str, str], str],
     on_warning: Callable[[str], None] | None = None,
+    find_pdf_url_from_page: Callable[[str], str] | None = None,
 ) -> tuple[int | None, str | None]:
     candidate_id = int(candidate["id"])
     paper_id = candidate.get("paper_id")
@@ -332,6 +334,13 @@ def process_discovery_candidate(
                         )
             if not pdf_url and paper_url:
                 pdf_url = get_jstage_pdf_url(paper_url)
+            if not pdf_url and find_pdf_url_from_page:
+                for page in (f"https://doi.org/{doi}" if doi else "", paper_url):
+                    if not page:
+                        continue
+                    pdf_url = find_pdf_url_from_page(page)
+                    if pdf_url:
+                        break
             if not pdf_url:
                 raise RuntimeError("公開PDFの直リンクが見つかりませんでした。")
             pdf_path = safe_paper_pdf_path(
