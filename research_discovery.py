@@ -277,6 +277,86 @@ def safe_paper_pdf_path(
     return os.path.join(pdf_directory, f"discovery_{paper_id}_{safe_title}.pdf")
 
 
+def find_candidate_pdf_url(
+    candidate: dict[str, Any],
+    fetch_pdf_url: Callable[..., str],
+    get_jstage_pdf_url: Callable[[str], str],
+    find_pdf_url_from_page: Callable[[str], str] | None = None,
+    on_warning: Callable[[str], None] | None = None,
+) -> str:
+    doi = normalize_doi(str(candidate.get("doi") or ""))
+    paper_url = str(candidate.get("url") or "").strip()
+    pdf_url = ""
+    if doi:
+        try:
+            pdf_url = fetch_pdf_url(doi, raise_on_error=True)
+        except Exception as exc:
+            if on_warning:
+                on_warning(
+                    f"Unpaywall検索に失敗しました。J-STAGEも確認します "
+                    f"({candidate['title']}): {exc}"
+                )
+    if not pdf_url and paper_url:
+        pdf_url = get_jstage_pdf_url(paper_url)
+    if not pdf_url and find_pdf_url_from_page:
+        for page in (f"https://doi.org/{doi}" if doi else "", paper_url):
+            if page:
+                pdf_url = find_pdf_url_from_page(page)
+                if pdf_url:
+                    break
+    return pdf_url
+
+
+def exclude_candidates_without_pdf(
+    connection_factory: Callable[[], sqlite3.Connection],
+    run_id: int,
+    fetch_pdf_url: Callable[..., str],
+    get_jstage_pdf_url: Callable[[str], str],
+    find_pdf_url_from_page: Callable[[str], str],
+    on_progress: Callable[[int, int], None] | None = None,
+) -> int:
+    """関連度A〜Dの未確認候補のPDF有無を調べ、無い候補を一覧から除外する"""
+    with closing(connection_factory()) as conn:
+        targets = [
+            dict(row) for row in conn.execute(
+                """SELECT * FROM discovery_candidates
+                WHERE run_id = ? AND paper_id IS NULL
+                AND grade IN ('A', 'B', 'C', 'D')
+                AND processing_status IN ('', '候補')""",
+                (run_id,),
+            ).fetchall()
+        ]
+    excluded = 0
+    for index, candidate in enumerate(targets, start=1):
+        pdf_url = ""
+        try:
+            pdf_url = find_candidate_pdf_url(
+                candidate, fetch_pdf_url, get_jstage_pdf_url,
+                find_pdf_url_from_page,
+            )
+        except Exception:
+            pdf_url = "unknown"
+        with closing(connection_factory()) as conn:
+            if pdf_url:
+                conn.execute(
+                    "UPDATE discovery_candidates SET processing_status = 'PDF確認済' WHERE id = ?",
+                    (candidate["id"],),
+                )
+            else:
+                excluded += 1
+                conn.execute(
+                    """UPDATE discovery_candidates
+                    SET processing_status = 'PDF未入手', is_selected = 0,
+                    processing_error = '公開PDFの直リンクが見つかりませんでした。'
+                    WHERE id = ?""",
+                    (candidate["id"],),
+                )
+            conn.commit()
+        if on_progress:
+            on_progress(index, len(targets))
+    return excluded
+
+
 def process_discovery_candidate(
     candidate: dict[str, Any],
     connection_factory: Callable[[], sqlite3.Connection],
@@ -321,26 +401,10 @@ def process_discovery_candidate(
             summary = summary or paper["ai_insight"] or ""
         if not pdf_path or not os.path.isfile(pdf_path):
             doi = normalize_doi(str(candidate.get("doi") or ""))
-            paper_url = str(candidate.get("url") or "").strip()
-            pdf_url = ""
-            if doi:
-                try:
-                    pdf_url = fetch_pdf_url(doi, raise_on_error=True)
-                except Exception as exc:
-                    if on_warning:
-                        on_warning(
-                            f"Unpaywall検索に失敗しました。J-STAGEも確認します "
-                            f"({candidate['title']}): {exc}"
-                        )
-            if not pdf_url and paper_url:
-                pdf_url = get_jstage_pdf_url(paper_url)
-            if not pdf_url and find_pdf_url_from_page:
-                for page in (f"https://doi.org/{doi}" if doi else "", paper_url):
-                    if not page:
-                        continue
-                    pdf_url = find_pdf_url_from_page(page)
-                    if pdf_url:
-                        break
+            pdf_url = find_candidate_pdf_url(
+                candidate, fetch_pdf_url, get_jstage_pdf_url,
+                find_pdf_url_from_page, on_warning,
+            )
             if not pdf_url:
                 raise RuntimeError("公開PDFの直リンクが見つかりませんでした。")
             pdf_path = safe_paper_pdf_path(

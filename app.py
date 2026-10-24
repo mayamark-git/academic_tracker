@@ -26,6 +26,7 @@ from cron_fetcher import (
     download_pdf_file
 )
 from research_discovery import (
+    exclude_candidates_without_pdf,
     add_discovery_candidate_to_library,
     analyze_research_baseline,
     build_baseline_context,
@@ -887,8 +888,21 @@ if page == "📄 論文一覧":
         sort_order = st.selectbox("並び替え", sort_opts, index=sort_idx)
         st.session_state.filter_sort = sort_order
 
+    source_opts = ["すべて", "関連文献探索から追加"]
+    if st.session_state.get("filter_source") not in source_opts:
+        st.session_state.filter_source = "すべて"
+    selected_source = st.selectbox(
+        "登録元",
+        source_opts,
+        index=source_opts.index(st.session_state.filter_source),
+    )
+    st.session_state.filter_source = selected_source
+
     query = "SELECT * FROM papers WHERE 1=1"
     params = []
+
+    if selected_source == "関連文献探索から追加":
+        query += " AND id IN (SELECT paper_id FROM discovery_candidates WHERE paper_id IS NOT NULL)"
 
     if author_query:
         query += " AND (author LIKE ? OR first_author LIKE ?)"
@@ -1676,6 +1690,23 @@ elif page == "🧭 自分の論文から探す":
                                 evaluation_failures,
                                 run_id=run_id,
                             )
+                        pdf_check_progress = st.progress(0.0)
+                        pdf_check_status = st.empty()
+
+                        def update_pdf_check_progress(completed, total):
+                            pdf_check_status.text(f"PDF有無を確認中 {completed}/{total}件")
+                            pdf_check_progress.progress(completed / max(total, 1))
+
+                        excluded_no_pdf = exclude_candidates_without_pdf(
+                            get_connection, run_id,
+                            fetch_pdf_url_from_unpaywall, get_jstage_pdf_url,
+                            find_pdf_url_from_landing_page,
+                            on_progress=update_pdf_check_progress,
+                        )
+                        st.session_state["discovery_last_result"] = (
+                            "info",
+                            f"PDFを取得できない {excluded_no_pdf} 件を候補から除外しました。",
+                        )
                         evaluated_count = len(evaluations)
                         failed_count = len(evaluation_failures)
                         if failed_count:
@@ -1829,6 +1860,34 @@ elif page == "🧭 自分の論文から探す":
                 dict(row) for row in run_candidates
                 if row["is_selected"] and row["paper_id"] is None
             ]
+            unchecked_pdf_count = sum(
+                1 for row in run_candidates
+                if row["paper_id"] is None
+                and row["grade"] in ("A", "B", "C", "D")
+                and row["processing_status"] in ("", "候補")
+            )
+            if unchecked_pdf_count and st.button(
+                f"🔎 PDFの有無が未確認の{unchecked_pdf_count}件を確認し、無い候補を除外",
+                key=f"check_pdf_availability_{latest_run['id']}",
+            ):
+                check_progress = st.progress(0.0)
+                check_text = st.empty()
+
+                def update_check_progress(completed, total):
+                    check_text.text(f"PDF有無を確認中 {completed}/{total}件")
+                    check_progress.progress(completed / max(total, 1))
+
+                excluded_count = exclude_candidates_without_pdf(
+                    get_connection, latest_run["id"],
+                    fetch_pdf_url_from_unpaywall, get_jstage_pdf_url,
+                    find_pdf_url_from_landing_page,
+                    on_progress=update_check_progress,
+                )
+                st.session_state["discovery_last_result"] = (
+                    "info",
+                    f"PDFを取得できない {excluded_count} 件を候補から除外しました。",
+                )
+                st.rerun()
             st.markdown("##### 選択した候補の処理")
             last_result = st.session_state.get("discovery_last_result")
             if last_result:
