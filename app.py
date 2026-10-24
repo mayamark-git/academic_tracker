@@ -34,15 +34,16 @@ from research_discovery import (
     filter_discovery_candidates,
     get_candidate_evaluation_label,
     get_discovery_candidates,
+    get_discovery_preferences,
     get_candidates_ready_for_evaluation_retry,
     get_discovery_runs,
     get_discovery_processing_status,
-    is_pdf_candidate_eligible,
     normalize_extraction,
     normalize_title,
     parse_researcher_candidates,
     process_discovery_candidate,
     save_candidate_evaluations,
+    save_discovery_preferences,
     save_research_baseline,
     search_discovery_candidates,
     set_discovery_candidate_selected,
@@ -1505,6 +1506,9 @@ elif page == "🧭 自分の論文から探す":
                     "SELECT keyword FROM target_keywords ORDER BY keyword COLLATE NOCASE"
                 ).fetchall()
             ]
+            discovery_preferences = get_discovery_preferences(
+                conn, baseline_row["id"]
+            )
         available_keywords = list(dict.fromkeys(
             available_keywords + registered_keywords
         ))
@@ -1521,15 +1525,36 @@ elif page == "🧭 自分の論文から探す":
             selected_keywords = st.multiselect(
                 "検索するキーワード・概念（最大5件）",
                 available_keywords,
-                default=available_keywords[:5],
+                default=[
+                    keyword for keyword in (
+                        discovery_preferences["keywords"]
+                        if discovery_preferences is not None
+                        else available_keywords[:5]
+                    )
+                    if keyword in available_keywords
+                ][:5],
                 key=f"discovery_keywords_{baseline_row['updated_at']}",
             )
             selected_researchers = st.multiselect(
                 "著者検索する研究者（最大5件）",
                 available_researchers,
-                default=available_researchers[:5],
+                default=[
+                    researcher for researcher in (
+                        discovery_preferences["researchers"]
+                        if discovery_preferences is not None
+                        else available_researchers[:5]
+                    )
+                    if researcher in available_researchers
+                ][:5],
                 key=f"discovery_researchers_{baseline_row['updated_at']}",
             )
+            with get_connection() as conn:
+                save_discovery_preferences(
+                    conn,
+                    baseline_row["id"],
+                    selected_keywords,
+                    selected_researchers,
+                )
             st.caption(
                 "キーワード・概念は最大5件、研究者名は最大5人です。"
                 "各検索条件から最大30件を取得します。"
@@ -1776,115 +1801,22 @@ elif page == "🧭 自分の論文から探す":
             )
             st.caption(f"表示中: {len(filtered_candidates)} / {len(run_candidates)} 件")
             st.info(
-                "各候補に2つのチェックがあります。\n\n"
-                "- **📄 PDF取得・要約の対象にする**：公開PDFを取得してAI要約を作り、成功した候補を論文一覧にも追加します。\n"
-                "- **📚 論文一覧に追加する**：メモ・既読管理ができる論文一覧に登録する候補を選びます"
-                "（PDF取得は行わず、書誌情報のみ登録します。取得済みのPDF・要約は引き継ぎます）。\n\n"
-                "チェック後、一覧の下にあるボタンを押すと実行されます。"
+                "候補ごとのチェックは共通です。チェックした候補は、一覧の上にあるボタンから"
+                "「書誌情報のみ追加」または「PDF取得・要約して追加」を選べます。"
             )
-            candidates_to_add = []
-            for candidate in filtered_candidates:
-                candidate = dict(candidate)
-                candidate_id = candidate["id"]
-                terms = ", ".join(json.loads(candidate["matched_terms_json"] or "[]"))
-                evaluation_label = get_candidate_evaluation_label(candidate)
-                already_in_library = candidate["paper_id"] is not None
-                st.markdown(
-                    f"**[{evaluation_label}] {candidate['title']}** — "
-                    f"{candidate['first_author'] or candidate['author'] or '著者不明'} "
-                    f"({candidate['pub_date'] or '年不明'})"
-                )
-                pdf_col, library_col = st.columns(2)
-                with library_col:
-                    if already_in_library:
-                        st.caption(f"📚 論文一覧に登録済み（ID: {candidate['paper_id']}）")
-                    elif st.checkbox(
-                        "📚 論文一覧に追加する",
-                        help="下の「論文一覧へ追加」ボタンで、チェックした候補を論文一覧に登録します。",
-                        key=f"discovery_add_to_library_{candidate_id}",
-                    ):
-                        candidates_to_add.append(candidate)
-                with pdf_col:
-                    selected = st.checkbox(
-                        "📄 PDF取得・要約の対象にする",
-                        value=bool(candidate["is_selected"]),
-                        disabled=not is_pdf_candidate_eligible(
-                            candidate["grade"], bool(candidate["is_insufficient"])
-                        ),
-                        help="判定済みの候補だけ選べます。下の「PDF取得・要約」ボタンで処理します。",
-                        key=f"discovery_candidate_{candidate_id}",
+            def save_discovery_selection(candidate_id, widget_key):
+                with get_connection() as conn:
+                    set_discovery_candidate_selected(
+                        conn, candidate_id, st.session_state[widget_key]
                     )
-                if selected != bool(candidate["is_selected"]):
-                    with get_connection() as conn:
-                        set_discovery_candidate_selected(
-                            conn, candidate_id, selected
-                        )
-                with st.expander("判定根拠・書誌情報", expanded=False):
-                    st.markdown(f"**内容との関連:** {candidate['content_reason'] or '根拠なし'}")
-                    st.markdown(f"**研究者との関連:** {candidate['researcher_reason'] or '根拠なし'}")
-                    if evaluation_label == "判定材料不足":
-                        st.warning(candidate["insufficient_reason"] or "抄録等の判定材料が不足しています。")
-                    elif evaluation_label == "判定エラー":
-                        st.warning(candidate["insufficient_reason"] or "AIの判定が完了しませんでした。再判定できます。")
-                    elif evaluation_label == "判定待ち":
-                        st.info("関連度判定がまだ完了していません。上の再判定ボタンを利用してください。")
-                    st.caption(f"検索語: {terms or '不明'}")
-                    if candidate["abstract"]:
-                        st.write(candidate["abstract"])
-                    if candidate["url"]:
-                        st.link_button("CiNiiの書誌情報を開く", candidate["url"])
-                    scholar_url = build_search_url(
-                        "https://scholar.google.com/scholar",
-                        "q",
-                        candidate["title"],
-                    )
-                    st.link_button(
-                        "Google Scholarで追加調査",
-                        scholar_url,
-                        key=f"discovery_scholar_{candidate_id}",
-                    )
-                    pdf_path = candidate.get("local_pdf_path") or ""
-                    summary = candidate.get("ai_insight") or ""
-                    if candidate.get("paper_id") is not None and (
-                        not pdf_path or not summary
-                    ):
-                        with get_connection() as conn:
-                            library_paper = conn.execute(
-                                """SELECT local_pdf_path, ai_insight
-                                FROM papers WHERE id = ?""",
-                                (candidate["paper_id"],),
-                            ).fetchone()
-                        if library_paper:
-                            pdf_path = pdf_path or library_paper["local_pdf_path"] or ""
-                            summary = summary or library_paper["ai_insight"] or ""
-                    if pdf_path and os.path.isfile(pdf_path):
-                        st.caption(f"PDF入手済み: {os.path.basename(pdf_path)}")
-                        with open(pdf_path, "rb") as pdf_file:
-                            st.download_button(
-                                "PDFを保存",
-                                data=pdf_file.read(),
-                                file_name=os.path.basename(pdf_path),
-                                mime="application/pdf",
-                                key=f"discovery_pdf_download_{candidate_id}",
-                            )
-                    elif candidate["processing_status"] in {"PDF未入手", "失敗"}:
-                        st.warning(
-                            f"PDF未入手・処理失敗: "
-                            f"{candidate['processing_error'] or candidate['processing_status']}"
-                        )
-                    else:
-                        st.caption("PDF未取得")
-                    if summary:
-                        st.markdown("**PDF本文に基づく要約**")
-                        st.write(summary)
-                    if candidate["processing_status"] != "候補":
-                        st.info(
-                            f"処理状態: {candidate['processing_status']}"
-                            + (f" — {candidate['processing_error']}" if candidate["processing_error"] else "")
-                        )
 
+            candidates_to_add = [
+                dict(row) for row in run_candidates
+                if row["is_selected"] and row["paper_id"] is None
+            ]
+            st.markdown("##### 選択した候補の処理")
             if st.button(
-                f"📚 チェックした{len(candidates_to_add)}件を論文一覧へ追加",
+                f"📚 チェックした{len(candidates_to_add)}件を書誌情報のみで論文一覧へ追加",
                 disabled=not candidates_to_add,
                 key=f"add_discovery_to_library_{latest_run['id']}",
             ):
@@ -1956,6 +1888,110 @@ elif page == "🧭 自分の論文から探す":
                     f"成功 {completed}件、失敗 {len(failures)}件"
                 )
                 st.rerun()
+
+            page_size = 20
+            total_candidate_pages = max(
+                math.ceil(len(filtered_candidates) / page_size), 1
+            )
+            page_key = f"discovery_page_{latest_run['id']}_{grade_filter}"
+            candidate_page = int(st.number_input(
+                f"表示ページ（全{total_candidate_pages}ページ・1ページ{page_size}件）",
+                min_value=1,
+                max_value=total_candidate_pages,
+                value=1,
+                step=1,
+                key=page_key,
+            ))
+            page_start = (candidate_page - 1) * page_size
+            for candidate in filtered_candidates[page_start:page_start + page_size]:
+                candidate = dict(candidate)
+                candidate_id = candidate["id"]
+                terms = ", ".join(json.loads(candidate["matched_terms_json"] or "[]"))
+                evaluation_label = get_candidate_evaluation_label(candidate)
+                already_in_library = candidate["paper_id"] is not None
+                st.markdown(
+                    f"**[{evaluation_label}] {candidate['title']}** — "
+                    f"{candidate['first_author'] or candidate['author'] or '著者不明'} "
+                    f"({candidate['pub_date'] or '年不明'})"
+                )
+                checkbox_key = f"discovery_candidate_{candidate_id}"
+                st.checkbox(
+                    "この候補を対象にする",
+                    value=bool(candidate["is_selected"]),
+                    help=(
+                        "チェックした候補を、一覧上のボタンから書誌情報のみ追加するか、"
+                        "PDF取得・要約して追加できます。"
+                    ),
+                    key=checkbox_key,
+                    on_change=save_discovery_selection,
+                    args=(candidate_id, checkbox_key),
+                )
+                if already_in_library:
+                    st.caption(f"📚 論文一覧に登録済み（ID: {candidate['paper_id']}）")
+                with st.expander("判定根拠・書誌情報", expanded=False):
+                    st.markdown(f"**内容との関連:** {candidate['content_reason'] or '根拠なし'}")
+                    st.markdown(f"**研究者との関連:** {candidate['researcher_reason'] or '根拠なし'}")
+                    if evaluation_label == "判定材料不足":
+                        st.warning(candidate["insufficient_reason"] or "抄録等の判定材料が不足しています。")
+                    elif evaluation_label == "判定エラー":
+                        st.warning(candidate["insufficient_reason"] or "AIの判定が完了しませんでした。再判定できます。")
+                    elif evaluation_label == "判定待ち":
+                        st.info("関連度判定がまだ完了していません。上の再判定ボタンを利用してください。")
+                    st.caption(f"検索語: {terms or '不明'}")
+                    if candidate["abstract"]:
+                        st.write(candidate["abstract"])
+                    if candidate["url"]:
+                        st.link_button("CiNiiの書誌情報を開く", candidate["url"])
+                    scholar_url = build_search_url(
+                        "https://scholar.google.com/scholar",
+                        "q",
+                        candidate["title"],
+                    )
+                    st.link_button(
+                        "Google Scholarで追加調査",
+                        scholar_url,
+                        key=f"discovery_scholar_{candidate_id}",
+                    )
+                    pdf_path = candidate.get("local_pdf_path") or ""
+                    summary = candidate.get("ai_insight") or ""
+                    if candidate.get("paper_id") is not None and (
+                        not pdf_path or not summary
+                    ):
+                        with get_connection() as conn:
+                            library_paper = conn.execute(
+                                """SELECT local_pdf_path, ai_insight
+                                FROM papers WHERE id = ?""",
+                                (candidate["paper_id"],),
+                            ).fetchone()
+                        if library_paper:
+                            pdf_path = pdf_path or library_paper["local_pdf_path"] or ""
+                            summary = summary or library_paper["ai_insight"] or ""
+                    if pdf_path and os.path.isfile(pdf_path):
+                        st.caption(f"PDF入手済み: {os.path.basename(pdf_path)}")
+                        with open(pdf_path, "rb") as pdf_file:
+                            st.download_button(
+                                "PDFを保存",
+                                data=pdf_file.read(),
+                                file_name=os.path.basename(pdf_path),
+                                mime="application/pdf",
+                                key=f"discovery_pdf_download_{candidate_id}",
+                            )
+                    elif candidate["processing_status"] in {"PDF未入手", "失敗"}:
+                        st.warning(
+                            f"PDF未入手・処理失敗: "
+                            f"{candidate['processing_error'] or candidate['processing_status']}"
+                        )
+                    else:
+                        st.caption("PDF未取得")
+                    if summary:
+                        st.markdown("**PDF本文に基づく要約**")
+                        st.write(summary)
+                    if candidate["processing_status"] != "候補":
+                        st.info(
+                            f"処理状態: {candidate['processing_status']}"
+                            + (f" — {candidate['processing_error']}" if candidate["processing_error"] else "")
+                        )
+
 
 
 # ============================================================

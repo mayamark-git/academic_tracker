@@ -471,6 +471,13 @@ def initialize_discovery_schema(conn: sqlite3.Connection) -> None:
         )
     """)
     conn.execute("""
+        CREATE TABLE IF NOT EXISTS discovery_preferences (
+            baseline_id INTEGER PRIMARY KEY,
+            keywords_json TEXT NOT NULL DEFAULT '[]',
+            researchers_json TEXT NOT NULL DEFAULT '[]'
+        )
+    """)
+    conn.execute("""
         CREATE TABLE IF NOT EXISTS discovery_candidates (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             run_id INTEGER NOT NULL,
@@ -520,6 +527,74 @@ def _ensure_discovery_column(
     }
     if column not in existing_columns:
         conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+
+
+def _clean_discovery_terms(terms: Any) -> list[str]:
+    if not isinstance(terms, list):
+        return []
+    return list(dict.fromkeys(
+        term.strip()
+        for term in terms
+        if isinstance(term, str) and term.strip()
+    ))
+
+
+def get_discovery_preferences(
+    conn: sqlite3.Connection,
+    baseline_id: int,
+) -> dict[str, list[str]] | None:
+    row = conn.execute(
+        """SELECT keywords_json, researchers_json
+        FROM discovery_preferences WHERE baseline_id = ?""",
+        (baseline_id,),
+    ).fetchone()
+    if row:
+        try:
+            keywords = json.loads(row[0])
+            researchers = json.loads(row[1])
+        except (json.JSONDecodeError, TypeError) as exc:
+            raise ValueError(f"保存したCiNii検索条件を読み取れません: {exc}") from exc
+        return {
+            "keywords": _clean_discovery_terms(keywords),
+            "researchers": _clean_discovery_terms(researchers),
+        }
+
+    latest_run = conn.execute(
+        "SELECT criteria_json FROM discovery_runs ORDER BY id DESC LIMIT 1"
+    ).fetchone()
+    if not latest_run:
+        return None
+    try:
+        criteria = json.loads(latest_run[0] or "{}")
+    except (json.JSONDecodeError, TypeError) as exc:
+        raise ValueError(f"直近のCiNii検索条件を読み取れません: {exc}") from exc
+    if not isinstance(criteria, dict):
+        raise ValueError("直近のCiNii検索条件の形式が不正です。")
+    return {
+        "keywords": _clean_discovery_terms(criteria.get("keywords")),
+        "researchers": _clean_discovery_terms(criteria.get("researchers")),
+    }
+
+
+def save_discovery_preferences(
+    conn: sqlite3.Connection,
+    baseline_id: int,
+    keywords: list[str],
+    researchers: list[str],
+) -> None:
+    conn.execute(
+        """INSERT INTO discovery_preferences (
+            baseline_id, keywords_json, researchers_json
+        ) VALUES (?, ?, ?)
+        ON CONFLICT(baseline_id) DO UPDATE SET
+            keywords_json = excluded.keywords_json,
+            researchers_json = excluded.researchers_json""",
+        (
+            baseline_id,
+            json.dumps(_clean_discovery_terms(keywords), ensure_ascii=False),
+            json.dumps(_clean_discovery_terms(researchers), ensure_ascii=False),
+        ),
+    )
 
 
 def save_research_baseline(

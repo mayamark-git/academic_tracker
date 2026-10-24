@@ -21,6 +21,7 @@ from research_discovery import (
     get_candidates_ready_for_evaluation_retry,
     get_discovery_processing_status,
     get_discovery_candidates,
+    get_discovery_preferences,
     get_discovery_runs,
     get_candidates_ready_for_processing,
     initialize_discovery_schema,
@@ -31,6 +32,7 @@ from research_discovery import (
     parse_relevance_response,
     parse_researcher_candidates,
     save_candidate_evaluations,
+    save_discovery_preferences,
     save_research_baseline,
     search_discovery_candidates,
     set_discovery_candidate_selected,
@@ -249,6 +251,45 @@ class ResearchDiscoveryTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(ValueError, "不明な関連度フィルター"):
             filter_discovery_candidates(candidates, "unknown")
+
+    def test_discovery_preferences_persist_and_fall_back_to_latest_search(self):
+        connection = sqlite3.connect(":memory:")
+        self.addCleanup(connection.close)
+        connection.execute("CREATE TABLE papers (id INTEGER PRIMARY KEY, doi TEXT)")
+        initialize_discovery_schema(connection)
+
+        self.assertIsNone(get_discovery_preferences(connection, 1))
+        create_discovery_run(
+            connection,
+            "baseline-version",
+            {"keywords": ["community"], "researchers": ["Jane Doe"]},
+            [],
+        )
+        self.assertEqual(
+            get_discovery_preferences(connection, 1),
+            {"keywords": ["community"], "researchers": ["Jane Doe"]},
+        )
+
+        save_discovery_preferences(
+            connection,
+            1,
+            [" participation ", "participation", "wellbeing"],
+            ["Jane Doe"],
+        )
+        create_discovery_run(
+            connection,
+            "later-baseline-version",
+            {"keywords": ["later"], "researchers": ["Someone Else"]},
+            [],
+        )
+
+        self.assertEqual(
+            get_discovery_preferences(connection, 1),
+            {
+                "keywords": ["participation", "wellbeing"],
+                "researchers": ["Jane Doe"],
+            },
+        )
 
     def test_candidate_selection_and_processing_status_are_persisted(self):
         connection = sqlite3.connect(":memory:")
