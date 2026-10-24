@@ -327,33 +327,38 @@ def exclude_candidates_without_pdf(
             ).fetchall()
         ]
     excluded = 0
-    for index, candidate in enumerate(targets, start=1):
-        pdf_url = ""
+    from concurrent.futures import ThreadPoolExecutor
+
+    def lookup(candidate: dict[str, Any]) -> str:
         try:
-            pdf_url = find_candidate_pdf_url(
+            return find_candidate_pdf_url(
                 candidate, fetch_pdf_url, get_jstage_pdf_url,
                 find_pdf_url_from_page,
             )
         except Exception:
-            pdf_url = "unknown"
-        with closing(connection_factory()) as conn:
-            if pdf_url:
-                conn.execute(
-                    "UPDATE discovery_candidates SET processing_status = 'PDF確認済' WHERE id = ?",
-                    (candidate["id"],),
-                )
-            else:
-                excluded += 1
-                conn.execute(
-                    """UPDATE discovery_candidates
-                    SET processing_status = 'PDF未入手', is_selected = 0,
-                    processing_error = '公開PDFの直リンクが見つかりませんでした。'
-                    WHERE id = ?""",
-                    (candidate["id"],),
-                )
-            conn.commit()
-        if on_progress:
-            on_progress(index, len(targets))
+            return "unknown"
+
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        results = executor.map(lookup, targets)
+        for index, (candidate, pdf_url) in enumerate(zip(targets, results), start=1):
+            with closing(connection_factory()) as conn:
+                if pdf_url:
+                    conn.execute(
+                        "UPDATE discovery_candidates SET processing_status = 'PDF確認済' WHERE id = ?",
+                        (candidate["id"],),
+                    )
+                else:
+                    excluded += 1
+                    conn.execute(
+                        """UPDATE discovery_candidates
+                        SET processing_status = 'PDF未入手', is_selected = 0,
+                        processing_error = '公開PDFの直リンクが見つかりませんでした。'
+                        WHERE id = ?""",
+                        (candidate["id"],),
+                    )
+                conn.commit()
+            if on_progress:
+                on_progress(index, len(targets))
     return excluded
 
 
