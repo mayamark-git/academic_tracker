@@ -1775,6 +1775,13 @@ elif page == "🧭 自分の論文から探す":
                 run_candidates, grade_filter
             )
             st.caption(f"表示中: {len(filtered_candidates)} / {len(run_candidates)} 件")
+            st.info(
+                "各候補に2つのチェックがあります。\n\n"
+                "- **📄 PDF取得・要約の対象にする**：公開PDFを取得してAI要約を作り、成功した候補を論文一覧にも追加します。\n"
+                "- **📚 論文一覧に追加する**：メモ・既読管理ができる論文一覧に登録する候補を選びます"
+                "（PDF取得は行わず、書誌情報のみ登録します。取得済みのPDF・要約は引き継ぎます）。\n\n"
+                "チェック後、一覧の下にあるボタンを押すと実行されます。"
+            )
             candidates_to_add = []
             for candidate in filtered_candidates:
                 candidate = dict(candidate)
@@ -1782,21 +1789,31 @@ elif page == "🧭 自分の論文から探す":
                 terms = ", ".join(json.loads(candidate["matched_terms_json"] or "[]"))
                 evaluation_label = get_candidate_evaluation_label(candidate)
                 already_in_library = candidate["paper_id"] is not None
-                if already_in_library:
-                    st.caption(f"論文一覧に登録済み（ID: {candidate['paper_id']}）")
-                elif st.checkbox(
-                    "論文一覧へ追加",
-                    key=f"discovery_add_to_library_{candidate_id}",
-                ):
-                    candidates_to_add.append(candidate)
-                selected = st.checkbox(
-                    f"[{evaluation_label}] {candidate['title']} — {candidate['first_author'] or candidate['author'] or '著者不明'} ({candidate['pub_date'] or '年不明'})",
-                    value=bool(candidate["is_selected"]),
-                    disabled=not is_pdf_candidate_eligible(
-                        candidate["grade"], bool(candidate["is_insufficient"])
-                    ),
-                    key=f"discovery_candidate_{candidate_id}",
+                st.markdown(
+                    f"**[{evaluation_label}] {candidate['title']}** — "
+                    f"{candidate['first_author'] or candidate['author'] or '著者不明'} "
+                    f"({candidate['pub_date'] or '年不明'})"
                 )
+                pdf_col, library_col = st.columns(2)
+                with library_col:
+                    if already_in_library:
+                        st.caption(f"📚 論文一覧に登録済み（ID: {candidate['paper_id']}）")
+                    elif st.checkbox(
+                        "📚 論文一覧に追加する",
+                        help="下の「論文一覧へ追加」ボタンで、チェックした候補を論文一覧に登録します。",
+                        key=f"discovery_add_to_library_{candidate_id}",
+                    ):
+                        candidates_to_add.append(candidate)
+                with pdf_col:
+                    selected = st.checkbox(
+                        "📄 PDF取得・要約の対象にする",
+                        value=bool(candidate["is_selected"]),
+                        disabled=not is_pdf_candidate_eligible(
+                            candidate["grade"], bool(candidate["is_insufficient"])
+                        ),
+                        help="判定済みの候補だけ選べます。下の「PDF取得・要約」ボタンで処理します。",
+                        key=f"discovery_candidate_{candidate_id}",
+                    )
                 if selected != bool(candidate["is_selected"]):
                     with get_connection() as conn:
                         set_discovery_candidate_selected(
@@ -1867,7 +1884,7 @@ elif page == "🧭 自分の論文から探す":
                         )
 
             if st.button(
-                f"選択した{len(candidates_to_add)}件を論文一覧へ追加",
+                f"📚 チェックした{len(candidates_to_add)}件を論文一覧へ追加",
                 disabled=not candidates_to_add,
                 key=f"add_discovery_to_library_{latest_run['id']}",
             ):
@@ -1893,7 +1910,7 @@ elif page == "🧭 自分の論文から探す":
                 )
 
             if st.button(
-                f"未完了の選択した{selected_count}件をPDF取得・要約",
+                f"📄 チェックした{selected_count}件をPDF取得・要約して論文一覧へ追加",
                 type="primary",
                 disabled=selected_count == 0,
                 key=f"process_discovery_pdfs_{latest_run['id']}",
@@ -1926,13 +1943,17 @@ elif page == "🧭 自分の論文から探す":
                     progress.progress(index / len(selected_rows))
                 if failures:
                     st.warning(
-                        f"{completed}件は処理完了、{len(failures)}件は失敗しました。\n"
+                        f"{completed}件は論文一覧への追加まで完了、"
+                        f"{len(failures)}件は失敗しました。\n"
                         + "\n".join(failures)
                     )
                 else:
-                    st.success(f"{completed}件のPDF取得・要約が完了しました。")
+                    st.success(
+                        f"{completed}件のPDF取得・要約と論文一覧への追加が完了しました。"
+                    )
                 progress_text.text(
-                    f"PDF取得・要約完了: 成功 {completed}件、失敗 {len(failures)}件"
+                    f"PDF取得・要約・論文一覧への追加: "
+                    f"成功 {completed}件、失敗 {len(failures)}件"
                 )
                 st.rerun()
 

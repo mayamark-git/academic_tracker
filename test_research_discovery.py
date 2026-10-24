@@ -259,7 +259,8 @@ class ResearchDiscoveryTests(unittest.TestCase):
         run_id = create_discovery_run(
             connection, "baseline", {}, [
                 {"title": "Ready", "matched_terms": []},
-                {"title": "Completed", "matched_terms": []},
+                {"title": "Completed and imported", "matched_terms": []},
+                {"title": "Completed, not imported", "matched_terms": []},
                 {"title": "Unqualified", "matched_terms": []},
             ],
         )
@@ -275,7 +276,12 @@ class ResearchDiscoveryTests(unittest.TestCase):
         ).fetchone()[0]
         completed_id = connection.execute(
             """SELECT id FROM discovery_candidates
-            WHERE run_id = ? AND title = 'Completed'""",
+            WHERE run_id = ? AND title = 'Completed and imported'""",
+            (run_id,),
+        ).fetchone()[0]
+        completed_unimported_id = connection.execute(
+            """SELECT id FROM discovery_candidates
+            WHERE run_id = ? AND title = 'Completed, not imported'""",
             (run_id,),
         ).fetchone()[0]
         unqualified_id = connection.execute(
@@ -285,11 +291,18 @@ class ResearchDiscoveryTests(unittest.TestCase):
         ).fetchone()[0]
         set_discovery_candidate_selected(connection, ready_id, True)
         set_discovery_candidate_selected(connection, completed_id, True)
+        set_discovery_candidate_selected(connection, completed_unimported_id, True)
         set_discovery_candidate_selected(connection, unqualified_id, True)
+        connection.execute(
+            """UPDATE discovery_candidates
+            SET processing_status = '完了', paper_id = 1
+            WHERE id = ?""",
+            (completed_id,),
+        )
         connection.execute(
             """UPDATE discovery_candidates SET processing_status = '完了'
             WHERE id = ?""",
-            (completed_id,),
+            (completed_unimported_id,),
         )
         connection.execute(
             """UPDATE discovery_candidates SET is_insufficient = 1
@@ -299,7 +312,10 @@ class ResearchDiscoveryTests(unittest.TestCase):
 
         ready, completed_count = get_discovery_processing_status(connection, run_id)
 
-        self.assertEqual([candidate["title"] for candidate in ready], ["Ready"])
+        self.assertEqual(
+            [candidate["title"] for candidate in ready],
+            ["Ready", "Completed, not imported"],
+        )
         self.assertEqual(completed_count, 1)
         set_discovery_candidate_selected(connection, ready_id, False)
         self.assertEqual(
@@ -834,20 +850,21 @@ class ResearchDiscoveryTests(unittest.TestCase):
                 is_selected INTEGER,
                 is_insufficient INTEGER,
                 grade TEXT,
-                processing_status TEXT
+                processing_status TEXT,
+                paper_id INTEGER
             )
         """)
         connection.executemany("""
             INSERT INTO discovery_candidates
-                (id, run_id, title, is_selected, is_insufficient, grade, processing_status)
-            VALUES (?, 1, ?, ?, ?, ?, ?)
+                (id, run_id, title, is_selected, is_insufficient, grade, processing_status, paper_id)
+            VALUES (?, 1, ?, ?, ?, ?, ?, ?)
         """, [
-            (1, "Pending", 1, 0, "A", "候補"),
-            (2, "Failed retry", 1, 0, "B", "失敗"),
-            (3, "Already complete", 1, 0, "A", "完了"),
-            (4, "Not selected", 0, 0, "A", "失敗"),
-            (5, "Insufficient", 1, 1, "A", "失敗"),
-            (6, "Low relevance", 1, 0, "C", "失敗"),
+            (1, "Pending", 1, 0, "A", "候補", None),
+            (2, "Failed retry", 1, 0, "B", "失敗", None),
+            (3, "Already complete", 1, 0, "A", "完了", 1),
+            (4, "Not selected", 0, 0, "A", "失敗", None),
+            (5, "Insufficient", 1, 1, "A", "失敗", None),
+            (6, "Low relevance", 1, 0, "C", "失敗", None),
         ])
 
         ready = get_candidates_ready_for_processing(connection, 1)

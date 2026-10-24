@@ -232,7 +232,7 @@ def get_candidates_ready_for_processing(
         """SELECT * FROM discovery_candidates
         WHERE run_id = ? AND is_selected = 1
         AND is_insufficient = 0 AND grade IN ('A', 'B', 'C', 'D')
-        AND processing_status != '完了'
+        AND (processing_status != '完了' OR paper_id IS NULL)
         ORDER BY id""",
         (run_id,),
     ).fetchall()
@@ -247,7 +247,7 @@ def get_discovery_processing_status(
         """SELECT COUNT(*) FROM discovery_candidates
         WHERE run_id = ? AND is_selected = 1
         AND is_insufficient = 0 AND grade IN ('A', 'B', 'C', 'D')
-        AND processing_status = '完了'""",
+        AND processing_status = '完了' AND paper_id IS NOT NULL""",
         (run_id,),
     ).fetchone()[0]
     return candidates, completed_count
@@ -354,18 +354,36 @@ def process_discovery_candidate(
                 )
                 conn.commit()
 
+        if not os.path.isfile(pdf_path):
+            raise RuntimeError("取得したPDFファイルを確認できませんでした。")
         if not summary:
             summary = summarize_pdf(candidate["title"], pdf_path)
+        if not str(summary).strip():
+            raise ValueError("AI要約を取得できませんでした。")
 
         with closing(connection_factory()) as conn:
-            conn.execute("""
-                UPDATE discovery_candidates
-                SET local_pdf_path = ?, ai_insight = ?,
-                    processing_status = '完了', processing_error = ''
-                WHERE id = ?
-            """, (pdf_path, summary, candidate_id))
-            conn.commit()
-        return paper_id, None
+            conn.execute("BEGIN")
+            try:
+                conn.execute(
+                    """UPDATE discovery_candidates
+                    SET local_pdf_path = ?, ai_insight = ?
+                    WHERE id = ?""",
+                    (pdf_path, summary, candidate_id),
+                )
+                library_paper_id = add_discovery_candidate_to_library(
+                    conn, candidate_id
+                )
+                conn.execute("""
+                    UPDATE discovery_candidates
+                    SET paper_id = ?, processing_status = '完了',
+                        processing_error = ''
+                    WHERE id = ?
+                """, (library_paper_id, candidate_id))
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+        return library_paper_id, None
     except Exception as exc:
         error_message = str(exc)
         status = (

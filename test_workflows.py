@@ -230,6 +230,10 @@ class OfflineWorkflowIntegrationTests(unittest.TestCase):
                 ).fetchone()
                 self.assertEqual(failed_row["processing_status"], "PDF未入手")
                 self.assertIsNone(failed_row["paper_id"])
+                self.assertEqual(
+                    connection.execute("SELECT COUNT(*) FROM papers").fetchone()[0],
+                    0,
+                )
 
             def download_pdf(url, path, **kwargs):
                 os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -253,7 +257,7 @@ class OfflineWorkflowIntegrationTests(unittest.TestCase):
                 on_warning=warning_messages.append,
             )
 
-            self.assertIsNone(retry_paper_id)
+            self.assertIsNotNone(retry_paper_id)
             self.assertIsNone(retry_error)
             with closing(get_connection(db_path)) as connection:
                 completed = connection.execute(
@@ -266,18 +270,19 @@ class OfflineWorkflowIntegrationTests(unittest.TestCase):
                 self.assertEqual(completed["processing_error"], "")
                 self.assertTrue(os.path.isfile(completed["local_pdf_path"]))
                 self.assertEqual(completed["ai_insight"], "Verified summary")
-                self.assertIsNone(completed["paper_id"])
-                paper_id = add_discovery_candidate_to_library(
-                    connection, candidate["id"]
-                )
+                self.assertEqual(completed["paper_id"], retry_paper_id)
                 library_paper = connection.execute(
-                    "SELECT * FROM papers WHERE id = ?", (paper_id,)
+                    "SELECT * FROM papers WHERE id = ?", (retry_paper_id,)
                 ).fetchone()
                 self.assertEqual(
                     library_paper["local_pdf_path"],
                     completed["local_pdf_path"],
                 )
                 self.assertEqual(library_paper["ai_insight"], "Verified summary")
+                self.assertEqual(
+                    connection.execute("SELECT COUNT(*) FROM papers").fetchone()[0],
+                    1,
+                )
             self.assertEqual(warning_messages, [])
 
     def test_explicit_candidate_import_preserves_existing_user_fields(self):
@@ -331,6 +336,44 @@ class OfflineWorkflowIntegrationTests(unittest.TestCase):
                 self.assertEqual(
                     connection.execute("SELECT COUNT(*) FROM papers").fetchone()[0],
                     1,
+                )
+
+    def test_candidate_is_not_imported_when_ai_summary_is_empty(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = os.path.join(temp_dir, "empty-summary.db")
+            pdf_dir = os.path.join(temp_dir, "pdfs")
+            with closing(get_connection(db_path, isolation_level=None)) as connection:
+                initialize_database(connection)
+                candidate = self._create_selected_candidate(connection)
+
+            def download_pdf(url, path, **kwargs):
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                with open(path, "wb") as downloaded:
+                    downloaded.write(b"%PDF-1.4\nfixture")
+                return True
+
+            paper_id, error = process_discovery_candidate(
+                candidate,
+                lambda: get_connection(db_path, isolation_level=None),
+                pdf_dir,
+                fetch_pdf_url=lambda doi, **kwargs: "",
+                get_jstage_pdf_url=lambda url: "https://example.org/article.pdf",
+                download_pdf=download_pdf,
+                summarize_pdf=lambda title, path: "",
+            )
+
+            self.assertIsNone(paper_id)
+            self.assertEqual(error, "AI要約を取得できませんでした。")
+            with closing(get_connection(db_path)) as connection:
+                candidate_row = connection.execute(
+                    "SELECT processing_status, paper_id FROM discovery_candidates WHERE id = ?",
+                    (candidate["id"],),
+                ).fetchone()
+                self.assertEqual(candidate_row["processing_status"], "失敗")
+                self.assertIsNone(candidate_row["paper_id"])
+                self.assertEqual(
+                    connection.execute("SELECT COUNT(*) FROM papers").fetchone()[0],
+                    0,
                 )
 
 
