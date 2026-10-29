@@ -74,6 +74,7 @@ Academic Tracker は、学術論文・研究者・学会を一元管理し、CiN
 - [docs/課題仮説シート.md](docs/課題仮説シート.md): 課題・解決仮説と検証案
 - [docs/wbs.md](docs/wbs.md): 機能単位の全体WBS
 - [docs/architecture.mmd](docs/architecture.mmd): Mermaidによる構成図
+- [backend/](backend/README.md): Cloud Run + Firestore 用バックエンド API（Streamlit アプリとは未連携）
 - [SPEC_CONTEXT.md](SPEC_CONTEXT.md): 企画時の仕様コンテキスト
 - [.github/copilot-instructions.md](.github/copilot-instructions.md): Copilot向け開発指示
 

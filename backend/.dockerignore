@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+test_*.py
+.env
+.env.*
+*.json
+*.db*
