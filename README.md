@@ -68,6 +68,15 @@ Academic Tracker は、学術論文・研究者・学会を一元管理し、CiN
 - papers.db: SQLite データベース
 - .env: ローカル環境変数（Git 管理対象外）
 
+提出用資料と開発時のAI向け指示は次のとおりです。
+
+- [docs/spec.md](docs/spec.md): 現行コードに基づく提出用仕様書
+- [docs/課題仮説シート.md](docs/課題仮説シート.md): 課題・解決仮説と検証案
+- [docs/wbs.md](docs/wbs.md): 機能単位の全体WBS
+- [docs/architecture.mmd](docs/architecture.mmd): Mermaidによる構成図
+- [SPEC_CONTEXT.md](SPEC_CONTEXT.md): 企画時の仕様コンテキスト
+- [.github/copilot-instructions.md](.github/copilot-instructions.md): Copilot向け開発指示
+
 ## セットアップ
 
 1. Python 3.10 以上の環境を用意します。

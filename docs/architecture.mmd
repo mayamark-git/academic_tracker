@@ -1,0 +1,17 @@
+flowchart TD
+    U[利用者] --> UI[Streamlit UI<br/>app.py]
+    UI --> DBL[DB接続・初期化<br/>database.py]
+    DBL --> DB[(SQLite<br/>papers.db)]
+    UI --> PDF[PDFファイル<br/>pdf_files/]
+    UI --> DISC[関連文献探索<br/>research_discovery.py]
+    UI --> WATCH[研究テーマ収集<br/>research_watch.py]
+    UI --> PROFILE[研究者プロフィール<br/>researcher_profiles.py]
+    UI --> FETCH[CiNii・PDF取得<br/>cron_fetcher.py]
+    UI --> GEMINI[Gemini API<br/>gemini_client.py / app.py]
+    DISC --> DB
+    WATCH --> DB
+    PROFILE --> DB
+    FETCH --> EXT[CiNii・Unpaywall・J-STAGE等]
+    WATCH --> EXT
+    GEMINI --> GOOGLE[Google GenAI / Search]
+    UI --> EXPORT[DBバックアップ・論文CSV]
